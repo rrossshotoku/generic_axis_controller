@@ -1,0 +1,31 @@
+# --- Build output (CubeIDE / GCC) -------------------------------------------
+Debug/
+Release/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.lst
+*.su
+
+# --- CubeIDE / Eclipse per-user state ---------------------------------------
+.settings/
+.metadata/
+.idea/
+.vscode/
+RemoteSystemsTempFiles/
+
+# --- Editor / OS noise -------------------------------------------------------
+*~
+*.bak
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
+
+# --- Claude / agent scratch --------------------------------------------------
+tmpclaude-*-cwd/
+.claude/
