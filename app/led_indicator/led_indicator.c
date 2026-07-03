@@ -19,11 +19,12 @@
  * enough that the operator can see "yes, it powered up". */
 #define BOOT_SOLID_MS         3000u
 
-/* Breathing — half a sine wave up, half down, repeating. 1s up + 1s down
- * per the spec. Brightness is computed each tick as a fraction of the
- * cycle position. */
-#define BREATH_UP_MS          1000u
-#define BREATH_DOWN_MS        1000u
+/* Breathing — perceptually-exponential ramp up + down, repeating. 500 ms
+ * up + 500 ms down = 1 s full cycle (doubled from the previous 2 s cycle).
+ * Brightness is computed each tick as a fraction of the cycle position
+ * then squared for the natural "breathing" feel — see breath_brightness. */
+#define BREATH_UP_MS          500u
+#define BREATH_DOWN_MS        500u
 #define BREATH_CYCLE_MS       (BREATH_UP_MS + BREATH_DOWN_MS)
 
 /* Network link-up flash: three blinks. ON_MS bright + OFF_MS dark per
@@ -48,23 +49,33 @@ static uint8_t s_b = 128;
 static uint32_t s_boot_ms;             /* time_ms() at led_indicator_init */
 static bool     s_link_was_up;         /* edge detection for link transitions */
 static uint32_t s_flash_started_ms;    /* 0 = no flash sequence active */
+static bool     s_prev_moving;         /* edge detect for motion stop */
+/* Settle-out phase: when motion stops mid-pulse we keep breathing until
+ * the next brightness peak so the LED never jumps from a dim value up
+ * to solid-on. Zero = not settling. */
+static uint32_t s_settle_started_ms;
+static uint32_t s_settle_duration_ms;
 
 /*----------------------------------------------------------------------------
  * Brightness computation per pattern
  *---------------------------------------------------------------------------*/
 
-/* Triangular ramp 0 -> 255 -> 0 over BREATH_CYCLE_MS. Linear (not
- * gamma-corrected) — perceptually it's good enough for an indicator
- * and saves a sin() / lookup table. */
+/* Squared-triangle ramp 0 -> 255 -> 0 over BREATH_CYCLE_MS. Approximates
+ * gamma ≈ 2 correction — matches the human eye's log-scale response so
+ * the pulse feels "natural" rather than mechanical: dim end lingers,
+ * bright end punches. Integer maths only (no sin/lookup), squaring in
+ * uint32 (255*255 = 65025) then dividing back to 8-bit. */
 static uint8_t breath_brightness(uint32_t now_ms)
 {
     uint32_t phase = now_ms % BREATH_CYCLE_MS;
+    uint32_t linear;
     if (phase < BREATH_UP_MS) {
-        return (uint8_t)((phase * 255u) / BREATH_UP_MS);
+        linear = (phase * 255u) / BREATH_UP_MS;
     } else {
         uint32_t down = phase - BREATH_UP_MS;
-        return (uint8_t)(255u - ((down * 255u) / BREATH_DOWN_MS));
+        linear = 255u - ((down * 255u) / BREATH_DOWN_MS);
     }
+    return (uint8_t)((linear * linear) / 255u);
 }
 
 /* In a flash sequence: ON for FLASH_ON_MS, OFF for FLASH_OFF_MS, repeated.
@@ -121,17 +132,43 @@ void led_indicator_tick(void)
         }
     }
 
-    if (axis_manager_is_moving()) {
+    bool moving = axis_manager_is_moving();
+    if (moving) {
+        /* Motion resumed (or ongoing) — cancel any settle-out and pulse. */
+        s_settle_duration_ms = 0u;
+        brightness = breath_brightness(now);
+    } else if (s_prev_moving) {
+        /* Motion just stopped this tick. Compute how long until the next
+         * brightness peak (phase == BREATH_UP_MS) so we finish the pulse
+         * gracefully instead of snapping to solid-on. */
+        uint32_t phase = now % BREATH_CYCLE_MS;
+        uint32_t ms_to_peak;
+        if (phase < BREATH_UP_MS) {
+            /* Currently on the way up — finish the ascent. */
+            ms_to_peak = BREATH_UP_MS - phase;
+        } else {
+            /* Currently on the way down — complete descent then next ascent. */
+            ms_to_peak = (BREATH_CYCLE_MS - phase) + BREATH_UP_MS;
+        }
+        s_settle_started_ms  = now;
+        s_settle_duration_ms = ms_to_peak;
+        brightness = breath_brightness(now);
+    } else if (s_settle_duration_ms != 0u
+            && time_elapsed_ms(s_settle_started_ms) < s_settle_duration_ms) {
+        /* Still finishing the post-motion pulse. */
         brightness = breath_brightness(now);
     } else if ((now - s_boot_ms) < BOOT_SOLID_MS) {
         /* Boot indicator window — solid full on. */
+        s_settle_duration_ms = 0u;
         brightness = 255u;
     } else {
         /* Idle steady state — solid full on at configured colour. The
          * configured colour itself is what dims things if the operator
          * wants a quieter indicator. */
+        s_settle_duration_ms = 0u;
         brightness = 255u;
     }
+    s_prev_moving = moving;
 
     bsp_leds_set_rgb((uint8_t)((uint32_t)s_r * brightness / 255u),
                      (uint8_t)((uint32_t)s_g * brightness / 255u),

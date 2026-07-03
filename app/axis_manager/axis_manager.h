@@ -94,6 +94,7 @@ uint16_t        axis_manager_get_auto_fault_clears  (void);    /* 0x3014 — sin
 bool     axis_manager_request_home              (void);        /* 0x3040 write 1 */
 uint8_t  axis_manager_get_home_status           (void);        /* 0x3041 — MC_IF_HOME_* mirror */
 bool     axis_manager_is_homed                  (void);        /* 0x3042 — fault_flags & NOT_HOMED == 0 */
+bool     axis_manager_encoder_is_incremental    (void);        /* true iff NOT_HOMED bit ever observed (incremental encoder) */
 
 /* --- 0x3010-0x301F commands (write-triggered) --- */
 bool  axis_manager_request_enable           (bool enable);  /* 0x3010 write 1/0 */
@@ -121,6 +122,11 @@ bool   axis_manager_set_joystick_value               (float v);      /* 0x3021 *
 float   axis_manager_get_joystick_max_velocity       (void);          /* 0x3022 (RO) */
 uint8_t axis_manager_get_joy_profile                 (void);
 bool    axis_manager_set_joy_profile                 (uint8_t p);     /* 0 NORMAL, 1 MEDIUM, 2 FINE */
+
+/* 0x3070 axis_role — which CAMERAD axis this CMC consumes from MOVEMENT.
+ * Value is a CAMERAD_AXIS_* bitmap value (single bit): PAN 0x01 ... FADER 0x80. */
+uint8_t axis_manager_get_axis_role                   (void);          /* 0x3070 */
+bool    axis_manager_set_axis_role                   (uint8_t r);     /* 0x3070 */
 
 float  axis_manager_get_target_velocity              (void);
 bool   axis_manager_set_target_velocity              (float v);      /* 0x3023 */

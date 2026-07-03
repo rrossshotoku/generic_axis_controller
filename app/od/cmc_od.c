@@ -159,6 +159,7 @@ MC_IfOdResult_t cmc_od_read(uint16_t idx, uint8_t sub,
         return MC_IF_OD_ERR_ACCESS;
     case 0x3041: READ_U8(axis_manager_get_home_status());
     case 0x3042: READ_U8(axis_manager_is_homed() ? 1u : 0u);
+    case 0x3070: READ_U8(axis_manager_get_axis_role());
 
     /* --- 0x3050-0x305F persistence triggers (WO) --- */
     case 0x3050:                /* cmc_save_config */
@@ -398,6 +399,12 @@ static MC_IfOdResult_t cmc_od_write_inner(uint16_t idx, uint8_t sub,
     case 0x3041:
     case 0x3042:
         return MC_IF_OD_ERR_ACCESS;
+
+    /* --- 0x3070 axis_role — CAMERAD_AXIS_* bitmap (single bit). */
+    case 0x3070:
+        sz = check_write_size(MC_IF_T_U8, in_len); if (sz != MC_IF_OD_OK) return sz;
+        if (in_type != MC_IF_T_U8) return MC_IF_OD_ERR_TYPE;
+        WRITE_OK_OR(axis_manager_set_axis_role(get_u8(in_data)));
 
     /* --- 0x3050 cmc_save_config: write MC_IF_SAVE_MAGIC to commit ---
      * Two-side save: CMC's own persist (axis_persist blob — joystick cal,

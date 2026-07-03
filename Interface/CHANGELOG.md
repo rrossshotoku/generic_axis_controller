@@ -23,6 +23,22 @@ This is the **authoritative change history** for the shared inter-MCU boundary c
 
 ---
 
+## [4.10.0] - 2026-07-02  (wire-breaking? no — additive: CMC-owned CAMERAD axis role selector)
+
+CMC-owned addition. Every CAMERAD MOVEMENT frame carries all 8 axis values (pan/tilt/zoom/focus/x/y/height/fader). Previously the CMC hardcoded consumption of `mv.pan`. `axis_role` (0x3070, U8, RW, PERSIST, MC_IF_OWNER_CMC) now selects which field the CMC pulls out on every frame. Values mirror the existing `CAMERAD_AXIS_*` bitmap: `PAN 0x01, TILT 0x02, ZOOM 0x04, FOCUS 0x08, X 0x10, Y 0x20, HEIGHT 0x40, FADER 0x80`. Default `PAN` for backwards compatibility. Setter rejects 0 and multi-bit values.
+
+`axis_bitmap` in the MOVEMENT frame is DELIBERATELY still ignored — a future change will gate frame consumption on it. Zero-value axis fields still flow through so releasing the stick drives the axis to a stop.
+
+### Persist
+- Adds one byte to `axis_persist_blob_t` — `AXIS_PERSIST_VERSION` bumped **4 → 5**. Boards with v4 blob fall through to coded defaults on first boot (joystick cal, motion limits, LED colour, and now axis_role all reset to defaults). Operator saves once to write the new v5 layout.
+
+### Consumers to update
+- **motor-control MCU**: nothing — CMC-owned entry.
+- **network MCU** (this project): implemented. `axis_manager` owns `axis_role` state + persist field; `controller_mgr` `handle_movement` picks the field per role.
+- **PC tool**: CMC Setup page gets a new "CAMERAD axis role" group with the 0x3070 row. Web UI gets a dedicated "Axis role" section with a dropdown (Pan/Tilt/Zoom/Focus/X/Y/Height/Fader) and an Apply button.
+
+---
+
 ## [4.9.0] - 2026-07-01  (wire-breaking? no — additive: CMC-side home-to-endstop orchestration + shot-recall gate)
 
 CMC-owned surface added on top of the motor's existing homing entries (0x2700:8/9 + `NOT_HOMED` bit in `0x2600:1` fault_flags — motor MCU unchanged). `axis_manager` runs the sequence: SDO-writes motor 0x2700:8=1, polls motor 0x2700:9 every 200 ms for `MC_IF_HOME_DONE` / `FAILED`, then re-reads motor `fault_flags` to refresh the local `is_homed` cache. Shot recalls in `cmc_state_move_to_shot` are now GATED on `is_homed`: a stored position on an un-homed incremental encoder is meaningless, so recalls are rejected with a warning until the operator has run the procedure once. Fresh `fault_flags` is also read once at first tick after boot so the gate has a real answer before the first move attempt.

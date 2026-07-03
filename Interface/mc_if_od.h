@@ -431,6 +431,13 @@ typedef enum
     X(0x3040, 0, axis_home_command,           MC_IF_T_U8,  MC_IF_A_WO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     X(0x3041, 0, axis_home_status,            MC_IF_T_U8,  MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     X(0x3042, 0, axis_is_homed,               MC_IF_T_U8,  MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
+    /* --- 0x3070 axis_role — which CAMERAD movement axis this physical CMC \
+     * consumes from every MOVEMENT frame. Values mirror CAMERAD_AXIS_* \
+     * bitmap: 0x01=PAN, 0x02=TILT, 0x04=ZOOM, 0x08=FOCUS, 0x10=X, 0x20=Y, \
+     * 0x40=HEIGHT, 0x80=FADER. controller_mgr uses this to pick the right \
+     * field out of camerad_movement_t. Default 0x01 (PAN) so existing \
+     * pan-axis units keep behaving as before. PERSIST in axis_persist_blob. */ \
+    X(0x3070, 0, axis_role,                   MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC) \
     /* --- 0x3050-0x305F CMC persistence triggers --- */ \
     /* Write MC_IF_SAVE_MAGIC (0x7376) to commit the corresponding region   */ \
     /* to the CMC's internal flash. Same magic constant used by the motor   */ \

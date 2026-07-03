@@ -6,13 +6,13 @@ import sys
 import time
 import traceback
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QLayout, QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton,
-    QScrollArea, QSlider, QSpinBox, QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox, QFormLayout, QGroupBox,
+    QHBoxLayout, QHeaderView, QLabel, QLayout, QLineEdit, QMainWindow, QMenu, QMessageBox,
+    QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter, QTabWidget, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import protocol as proto
@@ -169,6 +169,30 @@ class _FlowLayout(QLayout):
         return y + line_h - rect.y()
 
 
+# Wheel-over-combobox is the most common "I meant to scroll the page and
+# accidentally changed a config value" UX papercut. The application-level
+# QObject event filter approach doesn't reliably intercept these — Qt routes
+# wheel events to the widget's own wheelEvent() method before the filter
+# chain when there's no explicit focus. So we replace QComboBox.wheelEvent
+# on the class itself; every instance (existing and future) inherits the
+# no-op. Selection still changes normally by clicking and picking from the
+# popup, or by focusing and using arrow keys.
+_original_combo_wheel = QComboBox.wheelEvent
+def _combo_ignore_wheel(self, event):  # noqa: ARG001 — signature matches Qt
+    event.ignore()
+QComboBox.wheelEvent = _combo_ignore_wheel
+
+
+class _NoWheelOnComboFilter(QObject):
+    """Legacy event filter — retained as belt-and-braces but the
+    class-method override above is the primary mechanism."""
+
+    def eventFilter(self, obj, event):  # type: ignore[override]
+        if event.type() == QEvent.Type.Wheel and isinstance(obj, QComboBox):
+            return True
+        return False
+
+
 class MainWindow(QMainWindow):
     def __init__(self, od: OdModel):
         super().__init__()
@@ -182,6 +206,14 @@ class MainWindow(QMainWindow):
         self._last_sample_time = 0.0
         self._mcfg_vals: dict = {}      # latest read-back SI values, keyed (index,sub) -> for bandwidth estimates
         self._bw_labels: dict = {}      # gains group title -> est-bandwidth QLabel
+
+        # Global wheel-eater for QComboBox — install on the QApplication so
+        # every combobox in the app is covered without touching each call
+        # site. Kept as an instance attr so Qt doesn't garbage-collect it.
+        self._no_wheel_filter = _NoWheelOnComboFilter(self)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self._no_wheel_filter)
 
         self.setWindowTitle("CMC Object Dictionary Tool")
         self.resize(1280, 820)
@@ -1150,6 +1182,12 @@ class MainWindow(QMainWindow):
                 # axis_button_current — magnitude (A) the on-board UP/DOWN
                 # buttons inject while op_mode = TORQUE. UP = +I, DOWN = -I.
                 (0x302C, 0),
+            ]),
+            ("CAMERAD axis role", [
+                # axis_role (0x3070) — which CAMERAD MOVEMENT field this CMC
+                # consumes. U8 bitmap: 1=PAN 2=TILT 4=ZOOM 8=FOCUS 16=X
+                # 32=Y 64=HEIGHT 128=FADER. Persisted in axis_persist blob.
+                (0x3070, 0),
             ]),
         ]
 

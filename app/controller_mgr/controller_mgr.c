@@ -656,12 +656,25 @@ static void handle_movement(const camerad_header_t *req,
     camerad_movement_t mv;
     memcpy(&mv, body, sizeof(mv));
 
-    /* Single-motor CMC: only the pan axis is wired. axis_bitmap tells us
-     * which fields the panel actually populated; we still accept pan=0
-     * frames (operator released the stick) to drive the motor to a stop
-     * — that's distinct from "no MOVEMENT at all" (handled by the
-     * cmc_state watchdog). */
-    cmc_state_handle_movement(mv.pan);
+    /* Pick the axis field per this CMC's configured role (0x3070 axis_role).
+     * axis_bitmap is DELIBERATELY ignored for now — if the panel didn't push
+     * our field this frame we still consume the byte at that offset. Real
+     * axis-bitmap gating is a follow-up. Zero-value frames still flow through
+     * so releasing the stick drives to a stop; the "no MOVEMENT at all"
+     * case is handled by the cmc_state watchdog. */
+    int8_t v;
+    switch (axis_manager_get_axis_role()) {
+    case 0x02u: v = mv.tilt;   break;
+    case 0x04u: v = mv.zoom;   break;
+    case 0x08u: v = mv.focus;  break;
+    case 0x10u: v = mv.x;      break;
+    case 0x20u: v = mv.y;      break;
+    case 0x40u: v = mv.height; break;
+    case 0x80u: v = mv.fader;  break;
+    case 0x01u:
+    default:    v = mv.pan;    break;
+    }
+    cmc_state_handle_movement(v);
 }
 
 /* Human-readable CAMERAD opcode name for the dispatch log. Only the

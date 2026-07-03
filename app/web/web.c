@@ -394,6 +394,12 @@ static void build_config_json(void)
           "},"
           "\"dynamics\":{"
             "\"load_factor\":%s"
+          "},"
+          "\"axis\":{"
+            "\"encoder_incremental\":%u,"
+            "\"is_homed\":%u,"
+            "\"home_status\":%u,"
+            "\"role\":%u"
           "}"
         "}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
@@ -414,7 +420,11 @@ static void build_config_json(void)
         (unsigned long)axis_manager_get_joystick_raw_deadband(),
         (long)axis_manager_get_joystick_raw(),
         s_aup, s_adn, s_ajk,
-        s_load);
+        s_load,
+        (unsigned)(axis_manager_encoder_is_incremental() ? 1u : 0u),
+        (unsigned)(axis_manager_is_homed() ? 1u : 0u),
+        (unsigned)axis_manager_get_home_status(),
+        (unsigned)axis_manager_get_axis_role());
 
     if (n < 0 || (size_t)n >= sizeof(s_tx_buf)) {
         send_500("json too large");
@@ -517,6 +527,16 @@ static void apply_config_json(const char *json)
     if (dyn && *dyn == '{') {
         const char *p; float f;
         if ((p = find_key(dyn, "load_factor")) && parse_f32(p, &f)) (void)axis_manager_set_load_factor(f);
+    }
+
+    /* axis — currently just role (which CAMERAD MOVEMENT field this CMC
+     * consumes). Applied live; persists on the next Save all to flash. */
+    const char *ax = find_key(json, "axis");
+    if (ax && *ax == '{') {
+        const char *p; int32_t i;
+        if ((p = find_key(ax, "role")) && parse_i32(p, &i) && i > 0 && i <= 0xFF) {
+            (void)axis_manager_set_axis_role((uint8_t)i);
+        }
     }
 
     send_text_ok("ok");
@@ -625,6 +645,15 @@ static void handle_reboot(void)
     LOG_INFO("web: reboot requested via /api/reboot");
 }
 
+static void handle_home(void)
+{
+    /* Fire-and-forget kick to the axis_manager home sequencer. Progress is
+     * observable via /api/config's axis.home_status field (MC_IF_HOME_*
+     * enum) which the page polls at 2 s. */
+    if (axis_manager_request_home()) send_text_ok("ok");
+    else                             send_500("home busy or unavailable");
+}
+
 /*----------------------------------------------------------------------------
  * Dispatch
  *---------------------------------------------------------------------------*/
@@ -658,6 +687,10 @@ static void dispatch(const request_t *req)
     }
     if (req->method == METHOD_POST && path_eq(req, "/api/reboot")) {
         handle_reboot();
+        return;
+    }
+    if (req->method == METHOD_POST && path_eq(req, "/api/home")) {
+        handle_home();
         return;
     }
     send_404();

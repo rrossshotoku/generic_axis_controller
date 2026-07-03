@@ -126,6 +126,7 @@ typedef struct {
      * input changes. 0x3022 is exposed RO in the OD for observation. */
     float            joystick_max_velocity;
     uint8_t          joy_profile;            /* AXIS_JOY_PROFILE_* — CAMERAD JOY_PROFILE_* selects */
+    uint8_t          axis_role;              /* 0x3070 — CAMERAD_AXIS_* bitmap value; PAN default */
     float            target_velocity_rad_s;
     float            target_position_rad;
     float            target_time_s;
@@ -356,7 +357,7 @@ static float current_velocity_demand_rad_s(void)
  * app/led_indicator. The blob remains operator-tunables only; we co-locate
  * here rather than spinning up a 4th persist region for 3 bytes (the
  * existing CONFIG region is the only one with spare layout headroom). */
-#define AXIS_PERSIST_VERSION   4u
+#define AXIS_PERSIST_VERSION   5u
 
 typedef struct __attribute__((packed)) {
     float    joystick_max_velocity;
@@ -369,6 +370,7 @@ typedef struct __attribute__((packed)) {
     float    position_limit_hi_rad;
     float    accel_limit_rad_s2;
     uint8_t  led_rgb[3];                 /* v4: led_indicator colour */
+    uint8_t  axis_role;                  /* v5: 0x3070 CAMERAD_AXIS_* bitmap */
 } axis_persist_blob_t;
 
 static void apply_persist_blob(const axis_persist_blob_t *b)
@@ -388,6 +390,11 @@ static void apply_persist_blob(const axis_persist_blob_t *b)
     s_axis.position_limit_lo_rad = b->position_limit_lo_rad;
     s_axis.position_limit_hi_rad = b->position_limit_hi_rad;
     s_axis.accel_limit_rad_s2    = b->accel_limit_rad_s2;
+    /* v5: axis_role. Sanitize on load — an invalid saved value (e.g. 0,
+     * or something outside the 8 CAMERAD_AXIS_* bits) falls back to PAN
+     * so the CMC still processes MOVEMENT frames after a corrupted save. */
+    s_axis.axis_role = b->axis_role;
+    if (s_axis.axis_role == 0u) s_axis.axis_role = 0x01u;  /* PAN default */
     led_indicator_apply_persist(b->led_rgb);
     recompute_joystick_max_velocity();
 }
@@ -407,6 +414,7 @@ static void capture_persist_blob(axis_persist_blob_t *b)
     b->position_limit_hi_rad = s_axis.position_limit_hi_rad;
     b->accel_limit_rad_s2    = s_axis.accel_limit_rad_s2;
     led_indicator_capture_persist(b->led_rgb);
+    b->axis_role = s_axis.axis_role;
 }
 
 bool axis_manager_save_to_flash(void)
@@ -444,6 +452,7 @@ void axis_manager_init(void)
     s_axis.enable_latch      = true;
 
     s_axis.joy_profile            = AXIS_JOY_PROFILE_NORMAL;  /* boot to full-speed; not persisted */
+    s_axis.axis_role              = 0x01u;                    /* CAMERAD_AXIS_PAN — persisted, override on load */
     s_axis.velocity_limit_rad_s   = 10.0f;
     recompute_joystick_max_velocity();   /* derived — needs velocity_limit + profile set first */
     s_axis.position_limit_lo_rad  = -INFINITY;
@@ -1216,6 +1225,22 @@ bool    axis_manager_set_joy_profile(uint8_t p)
     return true;
 }
 
+uint8_t axis_manager_get_axis_role(void) { return s_axis.axis_role; }
+bool    axis_manager_set_axis_role(uint8_t r)
+{
+    /* Accept only single-bit values matching CAMERAD_AXIS_* (PAN..FADER).
+     * Rejects 0 and multi-bit (a CMC represents one axis, not several). */
+    if (r != 0x01u && r != 0x02u && r != 0x04u && r != 0x08u
+     && r != 0x10u && r != 0x20u && r != 0x40u && r != 0x80u) {
+        return false;
+    }
+    if (s_axis.axis_role != r) {
+        LOG_INFO("axis: role 0x%02X -> 0x%02X", (unsigned)s_axis.axis_role, (unsigned)r);
+    }
+    s_axis.axis_role = r;
+    return true;
+}
+
 float axis_manager_get_target_velocity(void) { return s_axis.target_velocity_rad_s; }
 bool  axis_manager_set_target_velocity(float v)
 {
@@ -1836,6 +1861,8 @@ static void tick_motor_save(void)
 
 typedef enum {
     HOME_SEQ_IDLE = 0,
+    HOME_SEQ_READING_ENCTYPE,  /* one-shot: SDO read motor 0x2500:8 quad_counts_per_rev */
+    HOME_SEQ_CLEARING_CMD,     /* SDO write 0x2700:8 = 0 — clear sticky DONE/FAILED */
     HOME_SEQ_WRITING_CMD,      /* SDO write 0x2700:8 = 1 in flight */
     HOME_SEQ_POLLING_STATUS,   /* periodic reads of 0x2700:9 */
     HOME_SEQ_READING_FAULT,    /* post-DONE re-read of 0x2600:1 */
@@ -1851,6 +1878,21 @@ static uint8_t            s_home_last_motor_status = 0;  /* mirror of motor 0x27
 static bool               s_is_homed             = false; /* fault_flags & NOT_HOMED == 0 */
 static bool               s_is_homed_known       = false; /* have we ever successfully read fault_flags? */
 static uint32_t           s_last_fault_read_ms   = 0;    /* time_ms of last kick; 0 = never */
+
+/* Encoder-type detection — read motor 0x2500:8 quad_counts_per_rev once at
+ * boot. Non-zero = incremental encoder is configured on the motor; zero =
+ * absolute (or unconfigured). Result is authoritative and doesn't depend
+ * on runtime homing state, so the web UI's "Home to end stop" button stays
+ * available even when the axis is currently homed. */
+static bool               s_encoder_type_known    = false;
+static bool               s_encoder_is_incremental = false;
+static uint32_t           s_last_enctype_read_ms  = 0;    /* 0 = never */
+
+/* Wait this long after CMC boot before the first attempt to read anything
+ * from the motor. Bootsync uses the same delay to give the motor's SPI
+ * link time to come up before we start hammering it with SDOs. */
+#define ENCTYPE_BOOT_DELAY_MS 2000u
+#define ENCTYPE_RETRY_MS      500u   /* retry cadence until first success */
 
 /* How often we re-read motor fault_flags to refresh is_homed.
  * RETRY_MS: while is_homed is unknown (previous reads failed / never fired).
@@ -1878,11 +1920,34 @@ bool axis_manager_is_homed(void)
     return s_is_homed_known && s_is_homed;
 }
 
+bool axis_manager_encoder_is_incremental(void)
+{
+    /* Read at boot from motor 0x2500:8 quad_counts_per_rev — non-zero =
+     * incremental, zero = absolute. Independent of runtime homing state
+     * so the operator can always re-home an incremental axis even when
+     * it's currently reporting is_homed = 1.
+     *
+     * Conservative fallback: while we haven't successfully read the value
+     * yet (first ~2 s after boot, or if the motor SDO isn't responding),
+     * return true. Better to show the Home button and have the operator
+     * click it needlessly on an absolute-encoder rig than to hide it when
+     * it's actually needed. Once we have a real reading it becomes
+     * authoritative. */
+    return !s_encoder_type_known || s_encoder_is_incremental;
+}
+
 bool axis_manager_request_home(void)
 {
     if (s_home_seq_state != HOME_SEQ_IDLE) return false;
     LOG_INFO("axis: HOME start");
-    s_home_seq_state    = HOME_SEQ_WRITING_CMD;
+    /* Reset the cached motor status so POLLING_STATUS can't short-circuit
+     * on a stale DONE/FAILED value from a previous run — otherwise the
+     * first read after write=1 might come back reporting the still-latched
+     * DONE and we'd skip straight to READING_FAULT without giving the
+     * motor time to run. Fresh IDLE means "we haven't heard from motor
+     * about this run yet". */
+    s_home_last_motor_status = MC_IF_HOME_IDLE;
+    s_home_seq_state    = HOME_SEQ_CLEARING_CMD;
     s_home_seq_start_ms = time_ms();
     s_home_last_poll_ms = 0;
     return true;
@@ -1901,6 +1966,26 @@ static void tick_home_sequencer(void)
      * session. And even on success, we needed to catch motor-side changes
      * we didn't drive ourselves (PC tool writing motor 0x2700:8 direct,
      * motor mid-session reset, etc.). */
+    /* --- One-shot encoder-type read (only while unknown) ---
+     * Wait ENCTYPE_BOOT_DELAY_MS after CMC startup so the motor's SPI link
+     * has time to come up. After that, retry at ENCTYPE_RETRY_MS until we
+     * get a valid reading. Once known, this stops firing. */
+    if (s_home_seq_state == HOME_SEQ_IDLE && !s_encoder_type_known) {
+        uint32_t now = time_ms();
+        if (now >= ENCTYPE_BOOT_DELAY_MS) {
+            bool due = (s_last_enctype_read_ms == 0u)
+                       || (time_elapsed_ms(s_last_enctype_read_ms) >= ENCTYPE_RETRY_MS);
+            if (due) {
+                cia402_od_handle_t h = cia402_od_read_begin(0x2500u, 8u, MC_IF_T_F32);
+                if (h != CIA402_OD_HANDLE_INVALID) {
+                    s_home_seq_handle = h;
+                    s_home_seq_state  = HOME_SEQ_READING_ENCTYPE;
+                    s_last_enctype_read_ms = now;
+                }
+            }
+        }
+    }
+
     if (s_home_seq_state == HOME_SEQ_IDLE) {
         uint32_t period = s_is_homed_known ? FAULT_READ_REFRESH_MS
                                            : FAULT_READ_RETRY_MS;
@@ -1930,6 +2015,57 @@ static void tick_home_sequencer(void)
     }
 
     switch (s_home_seq_state) {
+    case HOME_SEQ_READING_ENCTYPE: {
+        /* Consume the boot-time read of motor 0x2500:8 quad_counts_per_rev.
+         * Non-zero -> incremental encoder configured. Zero -> absolute
+         * (or unconfigured). Reply size is F32 (4 bytes). */
+        MC_IfOdResult_t res = MC_IF_OD_OK;
+        uint8_t buf[8] = {0};
+        uint8_t vlen   = sizeof(buf);
+        if (!cia402_od_poll(s_home_seq_handle, &res, buf, &vlen)) return;
+        s_home_seq_handle = CIA402_OD_HANDLE_INVALID;
+        if (res == MC_IF_OD_OK && vlen >= sizeof(float)) {
+            float cpr;
+            memcpy(&cpr, buf, sizeof(cpr));
+            s_encoder_is_incremental = (cpr != 0.0f);
+            s_encoder_type_known     = true;
+            LOG_INFO("axis: enc %s (cpr=%d)",
+                     s_encoder_is_incremental ? "inc" : "abs",
+                     (int)cpr);
+        }
+        /* On failure, s_encoder_type_known stays false and the retry
+         * cadence in the IDLE section above will fire the read again. */
+        s_home_seq_state = HOME_SEQ_IDLE;
+        break;
+    }
+    case HOME_SEQ_CLEARING_CMD: {
+        /* Write home_command = 0 first to clear any latched DONE/FAILED
+         * from a previous run (motor's home_command is edge-triggered per
+         * OD contract "0 = idle/abort (also clears done/failed)" — writing
+         * 1 while DONE is still latched would be a no-op on the motor
+         * side, and the CMC would spin until the overall timeout thinking
+         * it was still running). Only after this write completes do we
+         * write the actual "1" that arms the run. */
+        if (s_home_seq_handle == CIA402_OD_HANDLE_INVALID) {
+            uint8_t zero = 0u;
+            s_home_seq_handle = cia402_od_write_begin(
+                0x2700u, 8u, MC_IF_T_U8, &zero, sizeof(zero));
+            if (s_home_seq_handle == CIA402_OD_HANDLE_INVALID) return;
+        }
+        MC_IfOdResult_t res = MC_IF_OD_OK;
+        uint8_t buf[8] = {0};
+        uint8_t vlen   = sizeof(buf);
+        if (!cia402_od_poll(s_home_seq_handle, &res, buf, &vlen)) return;
+        s_home_seq_handle = CIA402_OD_HANDLE_INVALID;
+        if (res != MC_IF_OD_OK) {
+            LOG_ERROR("axis: HOME clr fail %d", (int)res);
+            s_home_seq_state = HOME_SEQ_TERMINAL_FAILED;
+            s_home_last_motor_status = MC_IF_HOME_FAILED;
+            return;
+        }
+        s_home_seq_state = HOME_SEQ_WRITING_CMD;
+        break;
+    }
     case HOME_SEQ_WRITING_CMD: {
         if (s_home_seq_handle == CIA402_OD_HANDLE_INVALID) {
             /* Try to issue the write. If cia402 is busy we retry next tick. */

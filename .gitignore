@@ -29,3 +29,7 @@ Thumbs.db
 # --- Claude / agent scratch --------------------------------------------------
 tmpclaude-*-cwd/
 .claude/
+
+# --- Python cache -----------------------------------------------------------
+__pycache__/
+*.py[cod]
