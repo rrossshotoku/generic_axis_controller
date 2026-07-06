@@ -33,3 +33,9 @@ tmpclaude-*-cwd/
 # --- Python cache -----------------------------------------------------------
 __pycache__/
 *.py[cod]
+
+# --- Diagnostic / capture artefacts ------------------------------------------
+*.pcapng
+*.pcap
+Interface/gui/motor_config.json
+Interface/gui/*_config.json

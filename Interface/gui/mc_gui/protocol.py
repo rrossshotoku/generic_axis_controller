@@ -9,7 +9,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-PROTOCOL_VERSION = 4  # MC_IF_PROTOCOL_VERSION (v4: cyclic header + position_actual + movement_status; v3: cyclic-cmd reshape)
+PROTOCOL_VERSION = 5  # MC_IF_PROTOCOL_VERSION (v5: bootloader contract — 0x1F5x + segmented SDO + node-state; v4: cyclic header + position_actual + movement_status; v3: cyclic-cmd reshape)
 UDP_MAGIC = 0x4D55  # 'MU'
 
 # Default ports (NETWORK_UDP_SPEC "Ports").
@@ -149,6 +149,19 @@ def parse_error(payload: bytes) -> ErrorMsg | None:
         return None
     error_class, detail, ref_seq = struct.unpack_from("<BBH", payload, 0)
     return ErrorMsg(error_class, detail, ref_seq)
+
+
+def is_transient_error(err: "ErrorMsg | None") -> bool:
+    """True if an error is worth retrying — server backpressure (INTERNAL / queue-full) or a
+    momentarily not-ready OD — as opposed to a hard error (bad index, read-only, type, range)
+    that a retry can never fix."""
+    if err is None:
+        return False
+    if err.error_class == 0x09:                         # INTERNAL -> queue-full / backpressure
+        return True
+    if err.error_class == 0x08 and err.detail == 0x08:  # OD result NOT_READY (server busy)
+        return True
+    return False
 
 
 @dataclass

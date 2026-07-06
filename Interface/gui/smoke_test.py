@@ -31,7 +31,7 @@ def test_od_parse():
     axis = model.get(0x3020, 0)  # CMC-owned axis_op_mode
     assert axis is not None and axis.owner == odmod.OWNER_CMC and axis.owner_name == "CMC"
     assert model.get(0x607B, 0) is not None  # v3 target_position_time_ms
-    assert proto.PROTOCOL_VERSION == 4
+    assert proto.PROTOCOL_VERSION == 5
     # value conversion round-trip on a scaled int
     raw = pa.si_to_raw(1.23456)
     assert abs(pa.raw_to_si(raw) - 1.23456) < 1e-4

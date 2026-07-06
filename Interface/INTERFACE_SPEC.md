@@ -269,6 +269,71 @@ These were "open points" in the original draft; they are now committed as v1 def
 
 Both firmware projects include `mc_if_protocol.h` and read these constants directly — no value is duplicated per-codebase. Re-tuning means editing this header and rebuilding both sides; no version bump, because the wire layout is unchanged.
 
+## 7. Bootloader control surface (protocol v5)
+
+The bootloader is a separately-linked binary on each MCU that shares the same wire format, framing, and OD dispatch as the app but implements a **reduced OD subset** (`0x1F5x`) for firmware updates. Full architecture in `Documentation/dual_bootloader_design.md`; this section documents only the wire additions.
+
+### 7a. Node state signals which binary is running
+
+The slave's `node_state` field (`CYCLIC_STATUS.node_state` + `HEARTBEAT.node_state`) reports which binary is active:
+
+| Value | Symbol | Meaning |
+|---:|---|---|
+| 0x00–0x06 | `MC_IF_NODE_INIT`…`_CALIBRATING` | App is running; existing OD table applies. |
+| **0x07** | **`MC_IF_NODE_BOOTLOADER`** | Bootloader is running. Only `0x1F5x` entries are accessible; all other OD reads return `ERR_NOT_BOOTLOADER`. Master **must** pause normal cyclic commands. |
+
+Transitions happen only across a reset — the master triggers "enter bootloader" via `OD_WRITE_REQ(0x1F51:1 = MC_IF_PROG_START)`, the slave resets into its bootloader, and the next `CYCLIC_STATUS` (or the response to any OD read) reports the new state.
+
+### 7b. OD entries — owner `MC_IF_OWNER_BOOTLOADER`
+
+Filtered out of the app-side OD table by the X-macro's owner column, so an app-mode target replies `ERR_NO_OBJECT` on read/write. Reads/writes are dispatched only when `node_state == MC_IF_NODE_BOOTLOADER`.
+
+| Index | Sub | Name | Type | Access | Purpose |
+|---:|---:|---|---|---|---|
+| `0x1F50` | 1 | `program_data` | U8 | WO | **Logical** firmware-bytes sink. NOT written via expedited `OD_WRITE_REQ`; bytes flow via the segmented-download message types below. The entry exists so the dispatch table is enumerable and its owner is explicit. |
+| `0x1F51` | 1 | `program_control` | U8 | RW | State command: `0x00 STOP`, `0x01 START`, `0x02 VERIFY`, `0x03 COMMIT`, `0x80 ABORT` — see `MC_IF_PROG_*`. |
+| `0x1F56` | 1 | `program_software_id` | U32 | RO | CRC32 of the currently running image. Used to short-circuit "already up-to-date" and to confirm a post-COMMIT reboot moved to the intended image. |
+| `0x1F57` | 1 | `flash_status` | U16 | RO | Bootloader state: `MC_IF_FLASH_IDLE / ERASING / PROGRAMMING / VERIFYING / FAULT`. |
+
+### 7c. Segmented download — three new message types
+
+Bulk firmware bytes are carried over three new master→slave / slave→master message types instead of `OD_WRITE_REQ` (whose 4 B expedited limit is unusable at KB scale). Reference: CiA-301 §7.2.4.3.
+
+| Value | Symbol | Direction | Payload |
+|---:|---|---|---|
+| `0x14` | `MC_IF_MSG_OD_DOWNLOAD_INIT` | master → slave | `MC_IfOdDownloadInit_t` — target index + subindex + total length |
+| `0x15` | `MC_IF_MSG_OD_DOWNLOAD_SEGMENT` | master → slave | `MC_IfOdDownloadSegment_t` — flags (bit 0 = toggle, bit 1 = last-segment), `seg_length`, `data[seg_length]` |
+| `0x16` | `MC_IF_MSG_OD_DOWNLOAD_RESP` | slave → master | `MC_IfOdDownloadResp_t` — echoed `toggle_ack`, `result`, `bytes_accepted` running total |
+
+Segment payload capacity is `MC_IF_MAX_PAYLOAD − 3` (roughly 49 B on the current 64 B frame). Sender alternates the toggle bit 0/1 across successive segments; receiver echoes the received toggle in its `RESP` and holds the "bytes accepted" watermark. Toggle mismatch → sender resends the same segment with the correct toggle. Last-segment bit signals end of stream — after receipt, the master issues `OD_WRITE_REQ(0x1F51:1 = MC_IF_PROG_VERIFY)` to trigger the CRC check.
+
+Apps that do not implement the bootloader OD range MUST reply `ERROR(MC_IF_ERR_UNKNOWN_MSG)` for these three types.
+
+### 7d. Bootloader-specific `MC_IfOdResult_t` codes
+
+New values on top of the existing generic set:
+
+| Value | Symbol | Meaning |
+|---:|---|---|
+| `0x09` | `MC_IF_OD_ERR_FLASH_LOCKED` | Sector write-protected (e.g. bootloader attempted to erase its own region). |
+| `0x0A` | `MC_IF_OD_ERR_CRC` | Verify failed — CRC32 of received image mismatches the expected. |
+| `0x0B` | `MC_IF_OD_ERR_BOOTLOADER_BUSY` | A download session is already in progress; abort first or wait. |
+| `0x0C` | `MC_IF_OD_ERR_NOT_BOOTLOADER` | Write to `0x1F5x` arrived while the target is in app mode (not bootloader). |
+
+### 7e. Update sequence (host-side)
+
+Both MCUs are addressed identically — the PC tool's "Update firmware" flow is one implementation that handles either target based only on IP/owner selection.
+
+```
+1. Read      0x1F56  (CRC of running image)
+2. If matches new image's CRC -> abort (already up-to-date)
+3. Write     0x1F51 = MC_IF_PROG_START  -> slave resets into bootloader
+4. Segmented-write bytes into 0x1F50 via DOWNLOAD_INIT + N × DOWNLOAD_SEGMENT
+5. Write     0x1F51 = MC_IF_PROG_VERIFY -> slave CRCs, transitions IDLE or FAULT
+6. Write     0x1F51 = MC_IF_PROG_COMMIT -> slave marks image valid + reboots into it
+7. Read      0x1F56  (confirm new CRC now running)
+```
+
 ## Open point (still confirm)
 
 - Whether to add configurable PDO mapping (host chooses which entries stream) vs the fixed

@@ -1,6 +1,7 @@
 """Main application window: OD browser, acyclic read/write, telemetry-map editor."""
 from __future__ import annotations
 
+import json
 import math
 import sys
 import time
@@ -9,10 +10,10 @@ import traceback
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox, QFormLayout, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QLayout, QLineEdit, QMainWindow, QMenu, QMessageBox,
-    QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter, QTabWidget, QTreeWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLayout, QLineEdit, QMainWindow, QMenu,
+    QMessageBox, QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter, QTabWidget,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import protocol as proto
@@ -32,6 +33,7 @@ STATUS_CHANNELS = ["statusword", "mode_display", "node_state", "error_code", "st
 MC_CAL_ALIGN_CAPTURE = 1       # 0x2700:1 = 1  -> run electrical alignment routine
 MC_CAL_CURRENT_OFFSET = 2      # (defined in the contract but NOT wired in firmware yet)
 MC_CAL_SET_MECH_ZERO = 3       # 0x2700:1 = 3  -> capture current position as mechanical home
+MC_CAL_SET_MECH_ZERO_AT = 4    # 0x2700:1 = 4  -> set mechanical home to mech_zero_set_rad (0x2700:10)
 MC_SAVE_MAGIC = 0x7376         # 0x2800:1      -> commit PERSIST values to flash
 MC_FACTORY_RESET_MAGIC = 0x7274  # 0x2800:3    -> erase saved config, restore defaults on reboot
 
@@ -91,7 +93,9 @@ _MCFG_READOUT_KEYS = [(0x2000, 6), (0x2410, 6), (0x2400, 6), (0x2400, 7), (0x300
 # Motor Command tab on-demand readouts (the accel-ramp "Read" button), routed to _cmd_on_state_read.
 _CMD_READOUT_KEYS = [(0x2300, 6), (0x2300, 7), (0x2300, 8)]   # accel ramp up / dn / jerk
 # Diagnostics group live readouts (faults + state, motor + CMC), routed to _cmd_on_state_read. (ADR-058)
-_DIAG_KEYS = [(0x2600, 1), (0x2600, 10), (0x6041, 0), (0x3000, 0), (0x3004, 0), (0x3005, 0), (0x3014, 0)]
+_DIAG_KEYS = [(0x2600, 1), (0x2600, 10), (0x2600, 11), (0x2600, 12), (0x2600, 13),
+              (0x6041, 0), (0x3000, 0), (0x3004, 0), (0x3005, 0), (0x3014, 0)]
+_FAULT_COUNT_SUBS = {11: "NO_CONFIG", 12: "NOT_HOMED", 13: "OVERCURRENT"}   # 0x2600:sub -> fault name (ADR-058)
 _MOTOR_FAULT_BITS = [(0x1, "NO_CONFIG"), (0x2, "NOT_HOMED"), (0x4, "OVERCURRENT")]
 
 def _decode_motor_faults(v: int) -> str:
@@ -1018,6 +1022,8 @@ class MainWindow(QMainWindow):
             self.diag_m_fault.setText(_decode_motor_faults(int(res["raw"])))
         elif key == (0x2600, 10):  # motor fault history (sticky since boot)
             self.diag_m_hist.setText(_decode_motor_faults(int(res["raw"])))
+        elif key in ((0x2600, 11), (0x2600, 12), (0x2600, 13)):  # per-fault since-boot counts (ADR-058)
+            self._diag_fc[key[1]] = int(res["raw"]); self._diag_update_counts()
         elif key == (0x3004, 0):   # CMC error code (ADR-058)
             self._diag_ec = int(res["raw"]); self._diag_update_cmc_err()
         elif key == (0x3005, 0):   # CMC error register
@@ -1250,6 +1256,16 @@ class MainWindow(QMainWindow):
         )
         b_save.clicked.connect(self._setup_save_to_flash)
         btns.addWidget(b_save)
+        b_cfg_save = QPushButton("Save config → file…")
+        b_cfg_save.setToolTip("Read all persisted config (motor + CMC) from the connected device and save a "
+                              "snapshot to a .json file on this PC. Restore it later with 'Load config'.")
+        b_cfg_save.clicked.connect(self._save_config_to_file)
+        btns.addWidget(b_cfg_save)
+        b_cfg_load = QPushButton("Load config ← file…")
+        b_cfg_load.setToolTip("Load a saved .json config snapshot and write it to the connected device (RAM). "
+                              "Then click 'Save to flash' to commit it.")
+        b_cfg_load.clicked.connect(self._load_config_from_file)
+        btns.addWidget(b_cfg_load)
         btns.addStretch(1)
         outer.addLayout(btns)
 
@@ -1392,6 +1408,76 @@ class MainWindow(QMainWindow):
             return
         self._log("SETUP SAVE -> CMC flash (writing OD 0x3050 = SAVE_MAGIC)", "TX")
         self.client.write_async(save_entry, self._SAVE_MAGIC)
+
+    def _save_config_to_file(self) -> None:
+        """Read all persisted config (motor + CMC RW+PERSIST) from the device -> a JSON snapshot on the PC."""
+        if not self.client.connected:
+            QMessageBox.warning(self, "Not connected", "Connect first — the snapshot reads live values from the device.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save config snapshot", "mc_config.json", "Config (*.json)")
+        if not path:
+            return
+        keys = {e.key for e in self.od.entries if e.writable and e.is_persist}
+        self._cfg_save_path = path
+        self._cfg_save_pending = set(keys)
+        self._cfg_save_values = {}
+        for e in self.od.entries:
+            if e.key in keys:
+                self.client.read_async(e)
+        QTimer.singleShot(8000, self._save_config_finalize)   # backstop if some reads never return
+        self._log(f"config snapshot: reading {len(keys)} entries…", "INFO")
+
+    def _save_config_finalize(self) -> None:
+        path = getattr(self, "_cfg_save_path", None)
+        if not path:
+            return   # already written (all reads returned first)
+        self._cfg_save_path = None
+        missing = len(getattr(self, "_cfg_save_pending", ()))
+        self._cfg_save_pending = set()
+        data = {"format": "mc_gui_config", "version": 1, "entries": self._cfg_save_values}
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except OSError as exc:
+            QMessageBox.warning(self, "Save failed", str(exc)); return
+        note = f"  ({missing} not read back)" if missing else ""
+        self._log(f"config snapshot: saved {len(self._cfg_save_values)} entries to {path}{note}", "INFO")
+
+    def _load_config_from_file(self) -> None:
+        """Load a JSON config snapshot and write each entry to the connected device (RAM)."""
+        if not self.client.connected:
+            QMessageBox.warning(self, "Not connected", "Connect first — loading writes the values to the device.")
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Load config snapshot", "", "Config (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Load failed", str(exc)); return
+        # Quiet the 1 Hz diagnostics poll during the bulk write so it doesn't compete for the CMC's
+        # forward queue; it resumes shortly after. (The client's transient-retry covers the rest.)
+        if hasattr(self, "diag_timer"):
+            self.diag_timer.stop()
+            QTimer.singleShot(3000, self.diag_timer.start)
+        wrote = skipped = 0
+        for kstr, info in data.get("entries", {}).items():
+            try:
+                idx_s, sub_s = kstr.split(":")
+                key = (int(idx_s, 16), int(sub_s))
+            except (ValueError, AttributeError):
+                skipped += 1; continue
+            e = self.od.by_key.get(key)
+            if e is not None and e.writable and isinstance(info, dict) and "raw" in info:
+                self.client.write_async(e, info["raw"]); wrote += 1
+            else:
+                skipped += 1
+        self._log(f"config snapshot: wrote {wrote} entries" + (f", skipped {skipped}" if skipped else ""), "INFO")
+        QMessageBox.information(self, "Config loaded",
+                               f"Wrote {wrote} config values to the device (RAM)."
+                               + (f"\nSkipped {skipped} (not writable / not in this build's OD)." if skipped else "")
+                               + "\n\nClick 'Save to flash' to commit them.")
 
     def _cmd_sweep_start(self) -> None:
         """Write the sweep params (0x2920:1-6) and start it with a clean enable 0->1 edge."""
@@ -1562,11 +1648,10 @@ class MainWindow(QMainWindow):
             ) != QMessageBox.StandardButton.Yes:
             return
         self._cmd_write((0x2700, 6), float(self.home_vel.value()), "home_velocity_rad_s")
-        self._cmd_write((0x2700, 7), float(self.home_cur.value()), "home_current_a")
         self._cmd_write((0x2700, 8), 1, "home_command")
         self.home_status_lbl.setText("RUNNING…")
         self.home_poll_timer.start()
-        self._log(f"homing: {self.home_vel.value():.2f} rad/s until |i| > {self.home_cur.value():.2f} A", "INFO")
+        self._log(f"homing: {self.home_vel.value():.2f} rad/s until no movement for 1 s or an OC trip", "INFO")
 
     def _home_stop(self) -> None:
         """Abort homing (home_command → 0)."""
@@ -1591,20 +1676,29 @@ class MainWindow(QMainWindow):
         self.diag_m_state = QLabel("—"); self.diag_m_state.setStyleSheet("font-weight:bold;")
         self.diag_m_fault = QLabel("—")
         self.diag_m_hist  = QLabel("—"); self.diag_m_hist.setStyleSheet("color:#a60;")
+        self.diag_m_counts = QLabel("—"); self.diag_m_counts.setStyleSheet("font-family: monospace;")
         self.diag_c_state = QLabel("—"); self.diag_c_state.setStyleSheet("font-weight:bold;")
         self.diag_c_err   = QLabel("—")
         self.diag_c_clr   = QLabel("—")
         dgl.addRow("Motor state:", self.diag_m_state)
         dgl.addRow("Motor active faults:", self.diag_m_fault)
         dgl.addRow("Motor fault history (since boot):", self.diag_m_hist)
+        dgl.addRow("Motor fault counts (since boot):", self.diag_m_counts)
         dgl.addRow("CMC state:", self.diag_c_state)
         dgl.addRow("CMC error:", self.diag_c_err)
         dgl.addRow("CMC auto-cleared faults:", self.diag_c_clr)
+        d_row = QHBoxLayout()
+        d_refresh = QPushButton("Refresh")
+        d_refresh.setToolTip("Read the fault flags, per-fault counts, and motor/CMC state now (manual read).")
+        d_refresh.clicked.connect(self._diag_poll)
+        d_row.addWidget(d_refresh)
         d_clr = QPushButton("Clear faults")
-        d_clr.setToolTip("Clear latched faults (CMC axis_clear_fault). The since-boot history is unaffected.")
+        d_clr.setToolTip("Clear latched faults (CMC axis_clear_fault). The since-boot history + counts are unaffected.")
         d_clr.clicked.connect(self._cmd_clear_fault)
-        dgl.addRow(d_clr)
-        self._diag_ec = 0; self._diag_er = 0
+        d_row.addWidget(d_clr)
+        d_row.addStretch(1)
+        dgl.addRow(d_row)
+        self._diag_ec = 0; self._diag_er = 0; self._diag_fc = {}
         self.diag_timer = QTimer(self)
         self.diag_timer.setInterval(1000)
         self.diag_timer.timeout.connect(self._diag_poll)
@@ -1618,6 +1712,10 @@ class MainWindow(QMainWindow):
             entry = self.od.by_key.get(key)
             if entry is not None and entry.readable:
                 self.client.read_async(entry)
+
+    def _diag_update_counts(self) -> None:
+        self.diag_m_counts.setText("   ".join(f"{name} {self._diag_fc.get(sub, 0)}"
+                                              for sub, name in _FAULT_COUNT_SUBS.items()))
 
     def _diag_update_cmc_err(self) -> None:
         ec = getattr(self, "_diag_ec", 0); er = getattr(self, "_diag_er", 0)
@@ -1898,14 +1996,9 @@ class MainWindow(QMainWindow):
         self.home_vel.setRange(-50.0, 50.0); self.home_vel.setSingleStep(0.5)
         self.home_vel.setDecimals(2); self.home_vel.setValue(-1.0); self.home_vel.setSuffix(" rad/s")
         self.home_vel.setToolTip("Approach velocity toward the end stop; sign = direction (usually negative). "
-                                 "Keep it slow for a gentle stall and a clean current rise.")
+                                 "The stop is found when movement stays negligible for 1 s (or an OC trip). "
+                                 "Keep it slow for a gentle stall.")
         hgl.addRow("approach velocity:", self.home_vel)
-        self.home_cur = QDoubleSpinBox()
-        self.home_cur.setRange(0.0, 50.0); self.home_cur.setSingleStep(0.5)
-        self.home_cur.setDecimals(2); self.home_cur.setValue(2.0); self.home_cur.setSuffix(" A")
-        self.home_cur.setToolTip("Stall-detect current: when |armature current| exceeds this for ~300 ms the end "
-                                 "stop is found. Set it BELOW the velocity current limit (0x2300:4) so it can trip.")
-        hgl.addRow("stall current:", self.home_cur)
         hrow = QHBoxLayout()
         self.home_run = QPushButton("Home")
         self.home_run.setToolTip("Drive toward the end stop; on stall, set the encoder zero there. Bypasses the "
@@ -2634,6 +2727,31 @@ class MainWindow(QMainWindow):
         actions.addStretch(1)
         lay.addLayout(actions)
 
+        # Centre the mech zero on the travel midpoint (ADR-022): capture both extremes (absolute
+        # mechanical position 0x2510:1), then set the zero to their midpoint (0x2700:1 = 4). This keeps
+        # the single-turn ±half-turn wrap seam outside the used range (ADR-038).
+        self._mz_ccw = None; self._mz_cw = None; self._mz_capturing = None
+        mzrow = QHBoxLayout()
+        b_mz_ccw = QPushButton("Capture CCW end")
+        b_mz_ccw.setToolTip("Jog to one travel extreme, then capture its absolute mechanical position (0x2510:1).")
+        b_mz_ccw.clicked.connect(lambda: self._mz_capture("ccw"))
+        mzrow.addWidget(b_mz_ccw)
+        b_mz_cw = QPushButton("Capture CW end")
+        b_mz_cw.setToolTip("Jog to the OTHER travel extreme, then capture its absolute mechanical position.")
+        b_mz_cw.clicked.connect(lambda: self._mz_capture("cw"))
+        mzrow.addWidget(b_mz_cw)
+        self.mz_lbl = QLabel("CCW: —   CW: —")
+        self.mz_lbl.setStyleSheet("font-family: monospace;")
+        mzrow.addWidget(self.mz_lbl)
+        b_mz_set = QPushButton("Set zero = midpoint")
+        b_mz_set.setToolTip("Set the mechanical zero to the midpoint of the two captured extremes (writes "
+                            "0x2700:10 then 0x2700:1 = 4). Centres travel so the wrap seam falls outside the "
+                            "used range. Auto-saved.")
+        b_mz_set.clicked.connect(self._mz_set_midpoint)
+        mzrow.addWidget(b_mz_set)
+        mzrow.addStretch(1)
+        lay.addLayout(mzrow)
+
         # Outstanding-calibrations checklist (0x2700:5 cal_done_flags) — the "what still
         # needs calibrating" view: each item shows done (✓) or outstanding (✗, emphasised),
         # and a summary names what's left.
@@ -2759,6 +2877,37 @@ class MainWindow(QMainWindow):
         self.lbl_cal_status.setText("requested…")
         self.client.write_async(entry, code)
         self._mcfg_poll_status()
+
+    def _mz_capture(self, which: str) -> None:
+        """Capture the absolute mechanical position (0x2510:1) at a travel extreme."""
+        if not self.client.connected:
+            QMessageBox.warning(self, "Not connected", "Connect to the CMC first."); return
+        entry = self.od.by_key.get((0x2510, 1))
+        if entry is None:
+            QMessageBox.warning(self, "Missing OD entry", "tlm_mech_position_rad (0x2510:1) not in OD."); return
+        self._mz_capturing = which
+        self.client.read_async(entry)
+
+    def _mz_update_label(self) -> None:
+        a = "—" if self._mz_ccw is None else f"{self._mz_ccw:+.4f}"
+        b = "—" if self._mz_cw is None else f"{self._mz_cw:+.4f}"
+        mid = "" if (self._mz_ccw is None or self._mz_cw is None) else f"   mid {(self._mz_ccw + self._mz_cw) / 2:+.4f}"
+        self.mz_lbl.setText(f"CCW: {a}   CW: {b}{mid}")
+
+    def _mz_set_midpoint(self) -> None:
+        """Set the mech zero to the midpoint of the two captured extremes (0x2700:10 + cal 4)."""
+        if self._mz_ccw is None or self._mz_cw is None:
+            QMessageBox.warning(self, "Capture both ends first",
+                                "Capture the CCW and CW travel extremes before setting the midpoint."); return
+        if not self.client.connected:
+            QMessageBox.warning(self, "Not connected", "Connect to the CMC first."); return
+        entry = self.od.by_key.get((0x2700, 10))
+        if entry is None:
+            QMessageBox.warning(self, "Missing OD entry", "mech_zero_set_rad (0x2700:10) not in this build's OD."); return
+        mid = (self._mz_ccw + self._mz_cw) / 2.0
+        self.client.write_async(entry, mid)                                       # value first (FIFO order)
+        self._mcfg_fire_cal(MC_CAL_SET_MECH_ZERO_AT, "set mech zero = midpoint")   # then fire the command
+        self._log(f"mech zero -> midpoint {mid:+.4f} rad (CCW {self._mz_ccw:+.4f}, CW {self._mz_cw:+.4f})", "INFO")
 
     def _mcfg_save(self) -> None:
         if not self.client.connected:
@@ -3066,6 +3215,22 @@ class MainWindow(QMainWindow):
         if res.get("ok") and isinstance(res.get("si"), (int, float)):
             self._mcfg_vals[entry.key] = float(res["si"])   # feed the bandwidth estimates
             self._mcfg_update_bw()
+        # Mech-zero centring: capture the absolute mechanical position at a travel extreme (0x2510:1).
+        if getattr(self, "_mz_capturing", None) and entry.key == (0x2510, 1) and res.get("ok"):
+            si = res.get("si")
+            if si is not None:
+                if self._mz_capturing == "ccw": self._mz_ccw = float(si)
+                else:                            self._mz_cw = float(si)
+                self._mz_capturing = None
+                self._mz_update_label()
+        # Config-snapshot collection ("Save config → file"): stash the raw value + finalize when all are in.
+        pend = getattr(self, "_cfg_save_pending", None)
+        if pend and entry.key in pend:
+            if res.get("ok"):
+                self._cfg_save_values[f"0x{entry.key[0]:04X}:{entry.key[1]}"] = {"name": entry.name, "raw": res["raw"]}
+            pend.discard(entry.key)
+            if not pend:
+                self._save_config_finalize()
         item = self.item_by_key.get(entry.key)
         is_probe = getattr(self, "_probe_key", None) == entry.key
         # Forward to a config tab (CMC Setup or Motor Config) if either owns this

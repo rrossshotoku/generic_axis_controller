@@ -28,6 +28,13 @@ from .od import OdEntry, OdModel
 RETRANSMIT_TIMEOUT = 0.05  # 50 ms (NETWORK_UDP_SPEC suggestion)
 RETRANSMIT_TRIES = 3
 
+# Application-level retry for TRANSIENT rejections (queue-full / not-ready): the link delivered a
+# reply, but the server was momentarily saturated. Retry the whole request with a fresh seq and
+# exponential backoff so it self-paces to the server's drain rate. Hard errors are never retried.
+QUEUE_RETRY_TRIES = 5
+QUEUE_RETRY_BACKOFF0 = 0.02     # 20 ms initial
+QUEUE_RETRY_BACKOFF_MAX = 0.32  # 320 ms cap
+
 
 @dataclass
 class TelemetrySample:
@@ -257,10 +264,31 @@ class NetworkClient(QObject):
                 return hdr, payload
         return None
 
+    def _transaction_retry(self, build_req):
+        """Run a transaction, rebuilding it with a fresh seq and backing off on a TRANSIENT
+        rejection (queue-full / not-ready), so a saturated server self-throttles instead of
+        dropping the request. build_req(seq) -> request bytes. Returns (hdr, payload) or None
+        (link lost). A hard error or exhausted retries returns the error reply as-is."""
+        backoff = QUEUE_RETRY_BACKOFF0
+        resp = None
+        for attempt in range(QUEUE_RETRY_TRIES + 1):
+            seq = self._next_seq()
+            resp = self._transaction(build_req(seq), seq)
+            if resp is None:
+                return None                               # link lost (already retransmitted)
+            hdr, payload = resp
+            if hdr.type != proto.MSG_ERROR:
+                return resp                               # normal read/write response
+            err = proto.parse_error(payload)
+            if attempt == QUEUE_RETRY_TRIES or not proto.is_transient_error(err):
+                return resp                               # hard error, or retries exhausted
+            time.sleep(backoff)                           # transient -> let it drain, then retry
+            backoff = min(backoff * 2.0, QUEUE_RETRY_BACKOFF_MAX)
+        return resp
+
     def _do_read(self, entry: OdEntry) -> None:
-        seq = self._next_seq()
-        req = proto.build_read_req(seq, entry.index, entry.sub, entry.type_code)
-        resp = self._transaction(req, seq)
+        resp = self._transaction_retry(
+            lambda seq: proto.build_read_req(seq, entry.index, entry.sub, entry.type_code))
         if resp is None:
             self.od_read_done.emit({"entry": entry, "ok": False, "error": "timeout"})
             return
@@ -283,10 +311,9 @@ class NetworkClient(QObject):
                                 "raw": raw, "si": entry.raw_to_si(raw)})
 
     def _do_write(self, entry: OdEntry, raw_value) -> None:
-        seq = self._next_seq()
         data = entry.encode(raw_value)
-        req = proto.build_write_req(seq, entry.index, entry.sub, entry.type_code, data)
-        resp = self._transaction(req, seq)
+        resp = self._transaction_retry(
+            lambda seq: proto.build_write_req(seq, entry.index, entry.sub, entry.type_code, data))
         if resp is None:
             self.od_write_done.emit({"entry": entry, "ok": False, "error": "timeout"})
             return

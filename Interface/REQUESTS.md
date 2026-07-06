@@ -790,3 +790,53 @@ The earlier CMC-only `0x3040 axis_payload_weight_kg` (CHANGELOG [3.6.0]) is bein
 *2026-06-25 (CMC side)*: filed during web-UI work. The original CMC-side `0x3040 axis_payload_weight_kg` was a placeholder pending exactly this kind of motor-side support. Now that the velocity loop will consume the value directly, the CMC-side entry is redundant and being removed in the same change. Range 0.3..2.0 is the operator's preferred clamp for the slider — motor can accept a wider range if helpful for tuning at extremes. Default 1.0 ensures no behavioural change for already-deployed boards on a fresh contract update.
 
 *2026-06-25 (motor side)*: **implemented.** Added `0x2300:5 vel_load_factor` (F32 RW PERSIST, default 1.0); the velocity loop applies `effective_kp = vel_kp × factor`, `effective_ki = vel_ki × factor` (kd unchanged) in `od_apply_gains`, with `factor = clamp(vel_load_factor, 0.3, 2.0)`. Seeded 1.0 in firmware defaults (behaviour-neutral on a fresh contract update). ADR-034 / CHANGELOG [4.1.0]. Your pending SDO writes to `0x2300:5` will now succeed. **Note:** I used a **clamp** to [0.3, 2.0] at apply time rather than rejecting out-of-range writes (the OD write path is a generic typed write, and a clamp can't zero/blow the loop gain) — your slider already clamps to 0.3..2.0 so this is invisible in practice; say if you'd prefer a hard write-rejection instead.
+
+## REQ-0015: Bootloader OD dispatch (0x1F5x) and segmented-SDO receiver
+
+- **Source**: Generic_axis_controller (CMC)
+- **Target**: Generic_motor_controller (motor MCU)
+- **Status**: in-progress
+- **Opened**: 2026-07-03
+- **Closed**: -
+- **Priority**: blocking (short-term: the contract additions in v5 currently `BAD_VERSION` your v4 SPI parser; longer-term: this REQ unlocks over-the-wire firmware update of the motor)
+
+### Why
+
+We want field-updatable firmware on both MCUs without JTAG. Phase 1 of the dual-bootloader design (`Documentation/dual_bootloader_design.md`) landed in the shared Interface as v5 — 4 new OD entries at `0x1F5x`, 3 new SPI message types for segmented download, new result codes, new node state, new owner value. This is contract only. The wire format is now v5, which is why your firmware currently sees `BAD_VERSION` on every SPI frame from a v5 CMC.
+
+Once you implement the receiver side of the bootloader OD, the CMC can drive both its own and your firmware updates via a single "Update firmware" UI in the PC tool.
+
+Full architecture: `Documentation/dual_bootloader_design.md`. Wire additions: `INTERFACE_SPEC.md §7`.
+
+### What's needed
+
+**1. Rebuild against v5 headers.** Minimum action to unblock existing operation. Your current SPI parser presumably strict-matches the version byte; a v5 CMC will `BAD_VERSION` against a v4 motor and vice versa. This is a rebuild-and-flash, no logic change beyond picking up the new enum values.
+
+**2. Handle `MC_IF_NODE_BOOTLOADER = 0x07` in your node-state reporter.** While the app is running, keep reporting the existing states (INIT / DISABLED / READY / RUNNING / QUICK_STOP / FAULT / CALIBRATING). Only report BOOTLOADER from a *separate bootloader binary* — see §5 of the design doc for the split.
+
+**3. Return `ERR_UNKNOWN_MSG` from the app for the three new message types.** `MC_IF_MSG_OD_DOWNLOAD_INIT / _SEGMENT / _RESP` (`0x14 / 0x15 / 0x16`). Your existing "unknown msg type → ERR" default dispatch should already do this — just confirm.
+
+**4. (Phase 2 — separate binary)** implement the motor-side bootloader:
+- Minimal bootloader at `0x0800_0000` that speaks the same `mc_if_protocol` framing over the same SPI link.
+- OD dispatch for `0x1F50 / 0x1F51 / 0x1F56 / 0x1F57` only. All other reads return `ERR_NO_OBJECT`.
+- Segmented-SDO receiver — reassemble `INIT + N×SEGMENT` into a flash-programming stream. Toggle bit handling per `INTERFACE_SPEC.md §7c`. Write bytes to the app-image slot as they arrive; do NOT buffer the entire image in RAM.
+- Flash programming — sector erase on `PROG_START`, word-program during segments, CRC32 on `PROG_VERIFY`, jump on `PROG_COMMIT`.
+- Trigger detection — app sets a RAM marker preserved across `NVIC_SystemReset` on receipt of `0x1F51 = MC_IF_PROG_START`; bootloader checks the marker on boot and stays in bootloader mode if set. Hard fallback if the app fails to set an alive flag within N seconds after last boot (protects against a boot-loop-crashing app).
+- Shared BSP — reuse your `motor_spi` + `flash` modules across the app and bootloader (a static library or shared-source pattern). Total flash budget is comfortable on the CMC's G474RE; verify yours has headroom for bootloader + app + optional A/B slots.
+
+### Acceptance
+
+Phase 1 (this REQ minimum) done when:
+- v5-labelled CMC frames parse cleanly on the motor and vice versa.
+- `MC_IfNodeState_t` on your side compiles with `MC_IF_NODE_BOOTLOADER = 0x07` present.
+- App returns `ERR_UNKNOWN_MSG` when it sees the three new download message types.
+
+Phase 2 (bootloader binary) done when:
+- PC tool can issue `0x1F51 = MC_IF_PROG_START` → motor reboots into bootloader → segmented-write a fresh image → `PROG_VERIFY` returns `IDLE` (not `FAULT`) → `PROG_COMMIT` reboots into the new image → `0x1F56` reports the new CRC.
+- Interrupted uploads leave the device recoverable via a re-attempt (no JTAG needed to unbrick).
+
+### Discussion
+
+*2026-07-03 (CMC side)*: filed as Phase 1 of the bootloader work lands. Only the wire additions are in this commit — no bootloader code exists yet on the CMC either. Phase 2 (both bootloader binaries) is a separate multi-week effort. The immediate practical impact for you is item **1** above; without it your firmware refuses any v5 SPI frame, which blocks all downstream OD traffic from the PC tool. Once you rebuild against v5, item 3's default dispatch should already handle the three new message types safely.
+
+*2026-07-03 (motor MCU, ADR-061)*: **Phase 1 (items 1–3) done.** Adopted contract v5 — added `OD_ROW_MC_IF_OWNER_BOOTLOADER` skip in `mc_od.c` (the OD X-macro otherwise fails to compile against v5, undefined owner-row for the `0x1F5x` entries), repointed the build + source include path to the moved canonical Interface, host-compiles clean against v5 (`fw_build 83`). Default message dispatch already returns `ERR_UNKNOWN_MSG` for `0x14/0x15/0x16`; node-state + result-code enums are additive. **Phase 2 (the motor bootloader binary — `0x1F5x` dispatch, segmented-SDO receiver, flash programming, reset-marker trigger, shared BSP) remains open.**

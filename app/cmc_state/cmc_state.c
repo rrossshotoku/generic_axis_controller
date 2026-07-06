@@ -62,9 +62,19 @@ static bool       s_move_ack_warned;   /* true after we've logged the WARN — d
 
 /* Joystick watchdog — track when we last received a CAMERAD MOVEMENT
  * message. If silence exceeds JOYSTICK_WATCHDOG_MS we zero the joystick
+ * so a hard-disconnected panel doesn't leave the motor running.
+ *
+ * 500 ms (was 100 ms). Observed panels burst-send MOVEMENT at ~25 ms
+ * nominal but with occasional 200 ms silences (Wireshark capture3 on
+ * 2026-07-03 confirms). A 100 ms watchdog fires on those silences and
+ * causes the motor to decelerate to zero then reaccelerate when trims
+ * resume — the operator sees "start-stop" motion. 500 ms survives any
+ * plausible panel/network hiccup while still stopping the axis within
+ * half a second of a genuine disconnect. Panel-released state still
+ * arrives as an explicit Pan=0 MOVEMENT frame (not gated by this).
  * raw value so the motor stops, rather than holding the last commanded
  * deflection forever (panel disconnect / network drop safety). */
-#define JOYSTICK_WATCHDOG_MS  100u
+#define JOYSTICK_WATCHDOG_MS  500u
 static uint32_t   s_last_movement_ms;
 static bool       s_movement_active;        /* true between first MOVEMENT and the watchdog firing */
 
@@ -454,7 +464,16 @@ void cmc_state_handle_movement(int8_t pan)
      * is mid-flight we ignore MOVEMENT frames entirely. The motor MCU
      * continues running its trajectory to the shot uninterrupted, and the
      * operator only regains live control once the move completes (or after
-     * a KEY_STOP, which clears s_moving via cmc_state_stop_movement).
+     * a KEY_STOP, which clears s_next_shot via cmc_state_stop_movement).
+     *
+     * Gate on s_next_shot, NOT s_moving. s_moving mirrors the motor's
+     * MOVING bit (line 543) and is TRUE whenever the axis is moving —
+     * including joystick-driven motion. Gating on s_moving would make the
+     * first accepted trim start the motor, s_moving turn true, then every
+     * subsequent trim be rejected, then the watchdog fire and zero the
+     * stick, then a fresh trim be accepted... = the start-stop hitch the
+     * operator sees. s_next_shot != 0 is the correct signal that a fade
+     * or cut recall is actually in flight.
      *
      * We deliberately do NOT stamp s_last_movement_ms while rejecting —
      * the watchdog stays passive, which is correct: there's nothing to
@@ -462,7 +481,7 @@ void cmc_state_handle_movement(int8_t pan)
      * suppressed too to keep the log clean during multi-second fades
      * (panels send MOVEMENT at ~25 ms intervals — 120 lines per 3 s
      * would dominate the log). */
-    if (s_moving) {
+    if (s_next_shot != 0u) {
         return;
     }
 

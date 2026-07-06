@@ -58,8 +58,13 @@ typedef enum
  */
 typedef enum
 {
-    MC_IF_OWNER_MOTOR = 0,   /* handled by Generic_motor_controller's OD table */
-    MC_IF_OWNER_CMC   = 1    /* handled by Lightweight_CMC's app/od/cmc_od */
+    MC_IF_OWNER_MOTOR      = 0,   /* handled by Generic_motor_controller's OD table */
+    MC_IF_OWNER_CMC        = 1,   /* handled by Generic_axis_controller's app/od/cmc_od */
+    MC_IF_OWNER_BOOTLOADER = 2    /* handled by the bootloader on either MCU. When
+                                   * the target is in bootloader mode (node_state ==
+                                   * MC_IF_NODE_BOOTLOADER) the 0x1F5x range dispatches
+                                   * to the bootloader's OD subset rather than the
+                                   * app's. See Documentation/dual_bootloader_design.md */
 } MC_IfOdOwner_t;
 
 /** @brief OD entry flags (bitmask). */
@@ -108,6 +113,7 @@ typedef enum
 #define MC_IF_CAL_ALIGN_CAPTURE    (1u)
 #define MC_IF_CAL_CURRENT_OFFSET   (2u)   /* measure phase-current ADC offsets; power stage must be off (ADR-026) */
 #define MC_IF_CAL_SET_MECH_ZERO    (3u)   /* capture current position as the mechanical home (ADR-022) */
+#define MC_IF_CAL_SET_MECH_ZERO_AT (4u)   /* set the mechanical home to mech_zero_set_rad (0x2700:10) -- midpoint-of-travel centering (ADR-022) */
 
 /* ===== Calibration completeness (0x2700/5 cal_done_flags, RO bitfield) =====
  * A set bit means that calibration currently has valid data; a CLEAR bit means it is
@@ -137,6 +143,25 @@ typedef enum
 #define MC_IF_FAULT_NO_CONFIG  (0x00000001u)  /* no valid persistent config loaded -> operational drive inhibited (ADR-051) */
 #define MC_IF_FAULT_NOT_HOMED  (0x00000002u)  /* incremental encoder not yet zeroed -> position recalls blocked; re-home each power-up (ADR-057) */
 #define MC_IF_FAULT_OVERCURRENT (0x00000004u)  /* over-current trip active (the OC trip); latched into fault_flags_latched too (ADR-058) */
+
+/* ===== Bootloader control (0x1F51:1 program_control) ============================
+ * PC tool writes these expedited to walk the target through an update. See
+ * Documentation/dual_bootloader_design.md §4 for the full sequence. */
+#define MC_IF_PROG_STOP            (0x00u)  /* Idle / cancel-in-progress. */
+#define MC_IF_PROG_START           (0x01u)  /* Begin a download session — bootloader erases slot then waits for segments. */
+#define MC_IF_PROG_VERIFY          (0x02u)  /* Compute CRC over the written image; flash_status reports VERIFYING then IDLE / FAULT. */
+#define MC_IF_PROG_COMMIT          (0x03u)  /* Mark the new image valid and reboot into it. */
+#define MC_IF_PROG_ABORT           (0x80u)  /* Force-cancel; discard any in-flight download. */
+
+/* ===== Bootloader flash status (0x1F57:1 flash_status) ==========================
+ * PC tool polls to show progress. IDLE = ready for the next command;
+ * FAULT = the last operation failed (CRC mismatch, flash write error,
+ * segment toggle mismatch, etc.). */
+#define MC_IF_FLASH_IDLE           (0x0000u)
+#define MC_IF_FLASH_ERASING        (0x0001u)
+#define MC_IF_FLASH_PROGRAMMING    (0x0002u)
+#define MC_IF_FLASH_VERIFYING      (0x0003u)
+#define MC_IF_FLASH_FAULT          (0x0004u)
 
 /* ===== Test-injection targets (0x2900/2) ===== */
 #define MC_IF_INJECT_NONE          (0u)
@@ -307,6 +332,10 @@ typedef enum
     X(0x2600, 9, traj_use_scurve,             MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     /* Sticky OR of every fault_flags bit set since boot -- fault history (faults triggered previously + cleared). Not persisted. (ADR-058) */ \
     X(0x2600, 10, fault_flags_latched,        MC_IF_T_U32, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    /* Per-fault trigger counts (U16, since boot, saturating): how many times each fault_flags bit has RISEN; RAM only. :11 NO_CONFIG, :12 NOT_HOMED, :13 OVERCURRENT. (ADR-058) */ \
+    X(0x2600, 11, fault_count_no_config,      MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    X(0x2600, 12, fault_count_not_homed,      MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    X(0x2600, 13, fault_count_overcurrent,    MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     /* --- 0x2700 calibration --- */ \
     X(0x2700, 1, cal_command,                 MC_IF_T_U16, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2700, 2, cal_status,                  MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
@@ -314,12 +343,18 @@ typedef enum
     X(0x2700, 4, cal_align_hold_ms,           MC_IF_T_U16, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2700, 5, cal_done_flags,              MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     /* Homing to a hard end stop for incremental encoders (ADR-057): drive at home_velocity (signed) until */ \
-    /* the armature current exceeds home_current for ~300 ms (the stall), then set the encoder zero there.  */ \
+    /* movement goes negligible for 1 s (or an OC trip) -- the stall -- then set the encoder zero there.    */ \
     /* home_command: 1 = run, 0 = idle/abort (also clears done/failed). home_status: MC_IF_HOME_*.          */ \
     X(0x2700, 6, home_velocity_rad_s,         MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    /* home_current_a: DEPRECATED -- homing now finds the stop by no-movement + OC trip, not this current.  */ \
+    /* Kept (unused) to avoid an OD-layout change / MC_IF_PROTOCOL_VERSION bump.                            */ \
     X(0x2700, 7, home_current_a,              MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2700, 8, home_command,                MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2700, 9, home_status,                 MC_IF_T_U8,  MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    /* mech_zero_set_rad: target for MC_IF_CAL_SET_MECH_ZERO_AT (cal_command 4) -- the tool writes the       */ \
+    /* desired mech-home position (absolute frame, e.g. midpoint of two captured travel extremes) + fires    */ \
+    /* the command. Transient (not persisted). (ADR-022)                                                    */ \
+    X(0x2700, 10, mech_zero_set_rad,          MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     /* --- 0x2800 persistent store --- */ \
     X(0x2800, 1, store_save_command,          MC_IF_T_U16, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2800, 2, store_status,                MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
@@ -451,6 +486,29 @@ typedef enum
     /* config (rides the axis_persist blob — AXIS_PERSIST_VERSION bumped 3 -> 4).    */ \
     X(0x3060, 0, led_color_r,                 MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC) \
     X(0x3061, 0, led_color_g,                 MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC) \
-    X(0x3062, 0, led_color_b,                 MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC)
+    X(0x3062, 0, led_color_b,                 MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC) \
+    /* --- 0x1F5x CiA-302 bootloader control surface — same OD entries on   */ \
+    /* both MCUs. Dispatched by the bootloader when the target is in         */ \
+    /* MC_IF_NODE_BOOTLOADER; refused (ERR_NOT_BOOTLOADER) when the app is   */ \
+    /* running. Owner is BOOTLOADER so the app's X-macro filter drops them   */ \
+    /* from the app-side OD table. See Documentation/dual_bootloader_design. */ \
+    /*                                                                      */ \
+    /* 0x1F50:1 program_data — LOGICAL sink for firmware bytes. Not written */ \
+    /* via expedited MC_IF_MSG_OD_WRITE_REQ (max payload 4 B, useless);     */ \
+    /* bytes flow via MC_IF_MSG_OD_DOWNLOAD_INIT + _SEGMENT. Kept in the OD */ \
+    /* so the entry is enumerable + ownership is explicit. Type U8 is       */ \
+    /* nominal — no host reads it as a typed scalar.                        */ \
+    X(0x1F50, 1, program_data,                MC_IF_T_U8,  MC_IF_A_WO, MC_IF_F_NONE, MC_IF_OWNER_BOOTLOADER) \
+    /* 0x1F51:1 program_control — expedited state command:                 */ \
+    /*   0x00 stop, 0x01 start-download, 0x02 verify (CRC),                */ \
+    /*   0x03 commit + reset, 0x80 abort.                                  */ \
+    X(0x1F51, 1, program_control,             MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_NONE, MC_IF_OWNER_BOOTLOADER) \
+    /* 0x1F56:1 program_software_id — CRC32 of currently running image;    */ \
+    /* PC tool reads this to skip re-flashing an image that's already up   */ \
+    /* to date and to confirm a post-update reboot.                        */ \
+    X(0x1F56, 1, program_software_id,         MC_IF_T_U32, MC_IF_A_RO, MC_IF_F_NONE, MC_IF_OWNER_BOOTLOADER) \
+    /* 0x1F57:1 flash_status — MC_IF_FLASH_* enum: IDLE/ERASING/PROGRAMMING/*/ \
+    /* VERIFYING/FAULT. Polled by the PC tool for progress + result.        */ \
+    X(0x1F57, 1, flash_status,                MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE, MC_IF_OWNER_BOOTLOADER)
 
 #endif /* MC_IF_OD_H */

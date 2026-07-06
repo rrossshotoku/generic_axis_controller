@@ -42,10 +42,16 @@ _Min_Heap_Size = 0x200; /* required amount of heap */
 _Min_Stack_Size = 0x400; /* required amount of stack */
 
 /* Memories definition */
+/* FLASH LENGTH is 504 K, not the chip's full 512 K, because the top 8 K
+ * (0x0807E000..0x0807FFFF) is reserved for persist regions — SHOTS at
+ * 0x0807E000, CONFIG at 0x0807F000, NETWORK at 0x0807F800 (see
+ * app/persist/persist.c). Reducing the FLASH region ensures the linker
+ * fails at link time if the app grows into the persist pages rather than
+ * silently overlapping and having persist_save erase live code. */
 MEMORY
 {
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 128K
-  FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 512K
+  FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 504K
 }
 
 /* Sections */

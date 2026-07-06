@@ -1,14 +1,20 @@
 /*
  * app/persist — non-volatile storage for CMC config + shots. See header.
  *
- * Layout matches the linker script's _FLASH_PERSIST_BASE = 0x0801E000.
+ * Layout matches the linker script's FLASH region cap (STM32G474RETX_FLASH.ld
+ * LENGTH = 0x7E000, i.e. code stops at 0x0807E000). Persist sits above the
+ * cap, in the last 8 KB of the G474RE's 512 KB flash — Bank 2 pages 252..255
+ * in bsp/flash's linear numbering.
  *
- * Region addresses (must match STM32G431RBTX_FLASH.ld):
- *   PERSIST_REGION_SHOTS  : 0x0801E000 .. 0x0801EFFF  (pages 60-61, 4 KB)
- *   PERSIST_REGION_CONFIG : 0x0801F000 .. 0x0801FFFF  (pages 62-63, 4 KB)
+ * Region addresses (must match STM32G474RETX_FLASH.ld's FLASH LENGTH cap):
+ *   PERSIST_REGION_SHOTS   : 0x0807E000 .. 0x0807EFFF  (linear pages 252-253, 4 KB)
+ *   PERSIST_REGION_CONFIG  : 0x0807F000 .. 0x0807F7FF  (linear page 254,     2 KB)
+ *   PERSIST_REGION_NETWORK : 0x0807F800 .. 0x0807FFFF  (linear page 255,     2 KB)
  *
- * We give config a single page (2 KB) and leave its second page reserved
- * for future growth; shots gets one 4 KB region across its two pages.
+ * Moved to the top of flash on the G431->G474 port so the app code region
+ * (which grew past the old mid-flash persist addresses) can't overlap them
+ * — the previous layout at 0x0801E000..0x0801FFFF was mid-Bank1 on the G474,
+ * so a persist_save could erase active code and brick the unit until reflash.
  */
 
 #include "persist.h"
@@ -31,20 +37,20 @@ typedef struct {
 
 static const region_info_t s_regions[PERSIST_REGION_COUNT] = {
     [PERSIST_REGION_CONFIG] = {
-        .base_addr   = 0x0801F000u,
-        .base_page   = 62u,
+        .base_addr   = 0x0807F000u,
+        .base_page   = 254u,
         .num_pages   = 1u,                  /* 2 KB; axis_manager config */
         .max_payload = PERSIST_CONFIG_MAX_BYTES,
     },
     [PERSIST_REGION_SHOTS]  = {
-        .base_addr   = 0x0801E000u,
-        .base_page   = 60u,
+        .base_addr   = 0x0807E000u,
+        .base_page   = 252u,
         .num_pages   = 2u,                  /* 4 KB; shot table */
         .max_payload = PERSIST_SHOTS_MAX_BYTES,
     },
     [PERSIST_REGION_NETWORK] = {
-        .base_addr   = 0x0801F800u,
-        .base_page   = 63u,
+        .base_addr   = 0x0807F800u,
+        .base_page   = 255u,
         .num_pages   = 1u,                  /* 2 KB; network config (IP etc) */
         .max_payload = PERSIST_NETWORK_MAX_BYTES,
     },

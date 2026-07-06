@@ -17,7 +17,7 @@
  *  Byte order: little-endian. All multi-byte fields are LE; structs are packed.
  */
 
-#define MC_IF_PROTOCOL_VERSION (4u)  /* v4: cyclic header gained position_actual_scaled + movement_status (REQ-0013/ADR-033) */
+#define MC_IF_PROTOCOL_VERSION (5u)  /* v5: bootloader contract — 0x1F5x OD entries + segmented SDO + node-state + new result codes (dual_bootloader_design.md §3) */
 #define MC_IF_SYNC_WORD        (0xA55Au)
 
 /* --- SPI transport unit (fixed-size frame per SPI transaction; see spec) --- */
@@ -40,14 +40,20 @@
 /** @brief Message types (frame.message_type). */
 typedef enum
 {
-    MC_IF_MSG_CYCLIC_CMD    = 0x01,  /* master -> slave: controlword, mode, targets, limits */
-    MC_IF_MSG_CYCLIC_STATUS = 0x02,  /* slave -> master: statusword, actuals, error code */
-    MC_IF_MSG_OD_READ_REQ   = 0x10,  /* master -> slave: read index/subindex */
-    MC_IF_MSG_OD_READ_RESP  = 0x11,  /* slave -> master: read result + value */
-    MC_IF_MSG_OD_WRITE_REQ  = 0x12,  /* master -> slave: write index/subindex */
-    MC_IF_MSG_OD_WRITE_RESP = 0x13,  /* slave -> master: write result */
-    MC_IF_MSG_HEARTBEAT     = 0x20,  /* both: link supervision / idle clocking */
-    MC_IF_MSG_ERROR         = 0x7F   /* both: protocol/object error report */
+    MC_IF_MSG_CYCLIC_CMD          = 0x01,  /* master -> slave: controlword, mode, targets, limits */
+    MC_IF_MSG_CYCLIC_STATUS       = 0x02,  /* slave -> master: statusword, actuals, error code */
+    MC_IF_MSG_OD_READ_REQ         = 0x10,  /* master -> slave: read index/subindex */
+    MC_IF_MSG_OD_READ_RESP        = 0x11,  /* slave -> master: read result + value */
+    MC_IF_MSG_OD_WRITE_REQ        = 0x12,  /* master -> slave: write index/subindex */
+    MC_IF_MSG_OD_WRITE_RESP       = 0x13,  /* slave -> master: write result */
+    /* v5: segmented SDO download (CiA-301 §7.2.4.3) — bulk firmware bytes
+     * flow via these three types. Only the bootloader needs to handle them;
+     * app-side must reply with MC_IF_ERR_UNKNOWN_MSG. See dual_bootloader_design.md §3. */
+    MC_IF_MSG_OD_DOWNLOAD_INIT    = 0x14,  /* master -> slave: begin, target index/sub + total length */
+    MC_IF_MSG_OD_DOWNLOAD_SEGMENT = 0x15,  /* master -> slave: one segment (toggle bit + payload bytes) */
+    MC_IF_MSG_OD_DOWNLOAD_RESP    = 0x16,  /* slave -> master: toggle-ack + result + bytes-accepted-so-far */
+    MC_IF_MSG_HEARTBEAT           = 0x20,  /* both: link supervision / idle clocking */
+    MC_IF_MSG_ERROR               = 0x7F   /* both: protocol/object error report */
 } MC_IfMessageType_t;
 
 /** @brief OD access result / abort code (OD read/write responses). */
@@ -61,7 +67,13 @@ typedef enum
     MC_IF_OD_ERR_RANGE     = 0x05,  /* value out of min/max */
     MC_IF_OD_ERR_SIZE      = 0x06,  /* data length mismatch */
     MC_IF_OD_ERR_CALLBACK  = 0x07,  /* read/write callback failed */
-    MC_IF_OD_ERR_NOT_READY = 0x08   /* state does not allow this access now */
+    MC_IF_OD_ERR_NOT_READY = 0x08,  /* state does not allow this access now */
+    /* v5: bootloader-specific errors. Emitted by the bootloader's OD dispatch
+     * or by the segmented-SDO state machine — see dual_bootloader_design.md. */
+    MC_IF_OD_ERR_FLASH_LOCKED    = 0x09, /* sector write-protected (e.g. bootloader region during a self-erase attempt) */
+    MC_IF_OD_ERR_CRC             = 0x0A, /* verify failed — image CRC32 mismatch */
+    MC_IF_OD_ERR_BOOTLOADER_BUSY = 0x0B, /* already in a download session; abort first or wait */
+    MC_IF_OD_ERR_NOT_BOOTLOADER  = 0x0C  /* write to 0x1F5x received while running the app (not in bootloader mode) */
 } MC_IfOdResult_t;
 
 /** @brief Protocol-level error classes (ERROR message). */
@@ -88,7 +100,11 @@ typedef enum
     MC_IF_NODE_RUNNING     = 0x03,
     MC_IF_NODE_QUICK_STOP  = 0x04,
     MC_IF_NODE_FAULT       = 0x05,
-    MC_IF_NODE_CALIBRATING = 0x06
+    MC_IF_NODE_CALIBRATING = 0x06,
+    /* v5: slave is in its bootloader, not its app. Cyclic frames now address
+     * only the bootloader OD subset (0x1F5x) — master must pause normal
+     * cyclic commands and only issue bootloader traffic. */
+    MC_IF_NODE_BOOTLOADER  = 0x07
 } MC_IfNodeState_t;
 
 /* ===== Frame ===== */
@@ -214,6 +230,40 @@ typedef struct __attribute__((packed))
     uint8_t  subindex;
     uint8_t  result;                 /* MC_IfOdResult_t */
 } MC_IfOdWriteResp_t;
+
+/** @brief OD_DOWNLOAD_INIT payload (master -> slave). Opens a segmented-SDO
+ *  session against a logical download sink (0x1F50:1 program_data). Only the
+ *  bootloader must accept this; the app returns MC_IF_ERR_UNKNOWN_MSG. */
+typedef struct __attribute__((packed))
+{
+    uint16_t index;                  /* target OD index (typically 0x1F50) */
+    uint8_t  subindex;               /* target subindex (typically 1) */
+    uint8_t  reserved;
+    uint32_t total_length;           /* total bytes the master intends to send */
+} MC_IfOdDownloadInit_t;
+
+/** @brief OD_DOWNLOAD_SEGMENT payload (master -> slave). One chunk of the
+ *  download. Segments are variable-length; on-wire size is
+ *  header + 3 + seg_length. Toggle bit alternates 0/1/0/1... to catch
+ *  reordered or dropped segments; slave echoes the received toggle in its
+ *  RESP. Sender resends on mismatch. */
+typedef struct __attribute__((packed))
+{
+    uint8_t  flags;                  /* bit0 = toggle, bit1 = last-segment */
+    uint8_t  reserved;
+    uint8_t  seg_length;             /* valid bytes in data[] */
+    uint8_t  data[1];                /* actual length is seg_length; up to (MC_IF_MAX_PAYLOAD - 3) */
+} MC_IfOdDownloadSegment_t;
+
+/** @brief OD_DOWNLOAD_RESP payload (slave -> master). Sent after INIT
+ *  and after each SEGMENT. */
+typedef struct __attribute__((packed))
+{
+    uint8_t  toggle_ack;             /* echo of the segment's toggle bit */
+    uint8_t  result;                 /* MC_IfOdResult_t — OK on happy path */
+    uint16_t reserved;
+    uint32_t bytes_accepted;         /* running total of good bytes received */
+} MC_IfOdDownloadResp_t;
 
 /** @brief HEARTBEAT payload (either direction; also used to clock out a pending response). */
 typedef struct __attribute__((packed))

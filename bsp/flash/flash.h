@@ -33,9 +33,13 @@
 extern "C" {
 #endif
 
-/* STM32G431RB constants (verified against HAL headers). */
+/* STM32G474RE dual-bank flash constants (verified against HAL headers).
+ * Linear page numbers 0..255 span both banks:
+ *   pages 0..127   -> Bank 1, 0x08000000..0x0803FFFF
+ *   pages 128..255 -> Bank 2, 0x08040000..0x0807FFFF
+ * flash_erase_page translates transparently. */
 #define FLASH_BSP_PAGE_BYTES   2048u   /* 2 KB per page */
-#define FLASH_BSP_PAGE_COUNT     64u   /* 128 KB / 2 KB */
+#define FLASH_BSP_PAGE_COUNT    256u   /* 512 KB / 2 KB */
 #define FLASH_BSP_BASE_ADDR    0x08000000u
 
 /* Convert between page index and absolute address. */

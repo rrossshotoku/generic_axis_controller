@@ -23,6 +23,53 @@ This is the **authoritative change history** for the shared inter-MCU boundary c
 
 ---
 
+## [5.1.0] - 2026-07-03  (wire-breaking? no — additive motor-owned OD entries)
+
+### Added
+- **`0x2600:11/12/13 fault_count_no_config / fault_count_not_homed / fault_count_overcurrent`** (U16 RO, motor-owned): per-fault **since-boot trigger counts** — how many times each `fault_flags` bit has *risen* (saturating, RAM only). Feeds the PC-tool Diagnostics panel (fault-counts row + a manual **Refresh** button). ADR-058.
+- **`0x2700:10 mech_zero_set_rad`** (F32 RW transient, motor-owned) + cal command **`MC_IF_CAL_SET_MECH_ZERO_AT`** (`0x2700:1 = 4`): set the mechanical zero to a *commanded* value (not just the current position), so the PC tool can capture both travel extremes (`0x2510:1`) and centre the zero on their midpoint without driving the axis there. ADR-060.
+
+### Consumers to update
+- **motor-control MCU**: implemented (motor-owned).
+- **network MCU**: none — motor-owned, forwarded as transport; no rebuild for wire compatibility.
+- **PC tool**: auto-appears via the X-macro parser; Diagnostics fault-counts + "Centre mech zero" UI added.
+
+---
+
+## [5.0.0] - 2026-07-03  (wire-breaking? YES — dual-bootloader contract adds messages + result codes + node state + owner)
+
+**Phase 1 (contract only)** of the CMC + motor-MCU dual-bootloader design. See `Documentation/dual_bootloader_design.md` for the full architecture; this changelog entry describes only the wire additions. No CMC or motor firmware yet implements bootloader mode — this commit is `.h`-only and produces the shared vocabulary the two firmwares + PC tool will consume.
+
+`MC_IF_PROTOCOL_VERSION` bumps **4 → 5**. Every consumer must recompile.
+
+### Added (OD entries — all owner `MC_IF_OWNER_BOOTLOADER`)
+- **`0x1F50:1 program_data`** (U8 WO) — logical firmware-bytes sink. Not written via expedited SDO; bytes arrive via new segmented-SDO messages.
+- **`0x1F51:1 program_control`** (U8 RW) — state command: `0x00 stop`, `0x01 start`, `0x02 verify`, `0x03 commit+reset`, `0x80 abort` (`MC_IF_PROG_*`).
+- **`0x1F56:1 program_software_id`** (U32 RO) — CRC32 of currently running image; used by the PC tool for "skip if already up-to-date" + post-reboot confirmation.
+- **`0x1F57:1 flash_status`** (U16 RO) — bootloader state enum: `IDLE / ERASING / PROGRAMMING / VERIFYING / FAULT` (`MC_IF_FLASH_*`).
+
+### Added (message types — CiA-301 §7.2.4.3 segmented download)
+- `MC_IF_MSG_OD_DOWNLOAD_INIT` (0x14) master→slave: opens session with target index/sub + total length.
+- `MC_IF_MSG_OD_DOWNLOAD_SEGMENT` (0x15) master→slave: one chunk, flags (toggle bit + last-segment bit) + payload. Segments carry up to `MC_IF_MAX_PAYLOAD − 3` bytes (~49 today).
+- `MC_IF_MSG_OD_DOWNLOAD_RESP` (0x16) slave→master: toggle-ack + result + bytes-accepted-so-far.
+
+### Added (owner + node-state)
+- `MC_IF_OWNER_BOOTLOADER = 0x02` — third owner value in `MC_IfOdOwner_t`. Apps filter these out of their local OD table; bootloaders serve them.
+- `MC_IF_NODE_BOOTLOADER = 0x07` — appears in cyclic status when the slave is in its bootloader. Master must pause normal cyclic commands and only issue bootloader traffic.
+
+### Added (result codes — extend `MC_IfOdResult_t`)
+- `0x09 MC_IF_OD_ERR_FLASH_LOCKED` — sector write-protected (e.g. bootloader tried to erase itself).
+- `0x0A MC_IF_OD_ERR_CRC` — verify failed, image CRC32 mismatch.
+- `0x0B MC_IF_OD_ERR_BOOTLOADER_BUSY` — already in a download session; abort first.
+- `0x0C MC_IF_OD_ERR_NOT_BOOTLOADER` — write to `0x1F5x` received while running the app.
+
+### Consumers to update
+- **motor-control MCU**: no bootloader implementation yet, but must rebuild against the new header (new enum values change enum size on some compilers; app-side must return `MC_IF_ERR_UNKNOWN_MSG` for the new download message types).
+- **network MCU** (this project): no bootloader implementation yet — Phase 2. App must return `MC_IF_ERR_UNKNOWN_MSG` on the new msg types (already does via default dispatch). Rebuild required.
+- **PC tool**: rebuild required. The three new download message types + four new OD entries auto-appear in the OD browser via the X-macro parser. Firmware-updater UI is future work (Phase 4).
+
+---
+
 ## [4.10.0] - 2026-07-02  (wire-breaking? no — additive: CMC-owned CAMERAD axis role selector)
 
 CMC-owned addition. Every CAMERAD MOVEMENT frame carries all 8 axis values (pan/tilt/zoom/focus/x/y/height/fader). Previously the CMC hardcoded consumption of `mv.pan`. `axis_role` (0x3070, U8, RW, PERSIST, MC_IF_OWNER_CMC) now selects which field the CMC pulls out on every frame. Values mirror the existing `CAMERAD_AXIS_*` bitmap: `PAN 0x01, TILT 0x02, ZOOM 0x04, FOCUS 0x08, X 0x10, Y 0x20, HEIGHT 0x40, FADER 0x80`. Default `PAN` for backwards compatibility. Setter rejects 0 and multi-bit values.
