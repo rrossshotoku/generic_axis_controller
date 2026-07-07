@@ -167,6 +167,110 @@ typedef struct {
 
 static axis_t s_axis;
 
+/*----------------------------------------------------------------------------
+ * Operation arbitration state
+ *
+ * s_active_op is the currently-in-flight operation family (or NONE for
+ * idle). Only cross-family transitions arbitrate; same-family requests
+ * pass through as retarget. Completion detection lives in _tick_active_op
+ * and clears s_active_op back to NONE.
+ *
+ * JOYSTICK_QUIESCENT_HOLD_MS gates the joystick->NONE transition: after
+ * both joystick_value hits 0 and motor movement_status.MOVING clears, we
+ * wait this long before releasing the JOYSTICK operation. Prevents rapid
+ * flapping when the operator briefly parks the stick at centre and then
+ * pushes again — but short enough that a genuine "release, then hit shot
+ * recall" gesture flows through without operator perceiving a lockout.
+ *---------------------------------------------------------------------------*/
+static axis_operation_t s_active_op                 = AXIS_OPERATION_NONE;
+static uint32_t         s_active_op_started_ms      = 0u;   /* time_ms() of NONE->op transition, for logging */
+static uint32_t         s_joystick_quiescent_since_ms = 0u; /* 0 = not quiescent; else first tick both stopped */
+#define JOYSTICK_QUIESCENT_HOLD_MS  200u
+
+/* Forward declarations — bodies live near the home sequencer where the
+ * related state is declared. */
+static void tick_active_op(void);
+static void abort_motor_homing_best_effort(void);
+
+static const char *op_name(axis_operation_t op)
+{
+    switch (op) {
+        case AXIS_OPERATION_NONE:        return "NONE";
+        case AXIS_OPERATION_HOMING:      return "HOMING";
+        case AXIS_OPERATION_SHOT_RECALL: return "SHOT_RECALL";
+        case AXIS_OPERATION_JOYSTICK:    return "JOYSTICK";
+        default:                         return "?";
+    }
+}
+
+static void set_active_op(axis_operation_t new_op)
+{
+    if (s_active_op == new_op) return;
+    LOG_INFO("axis_manager: active_op %s -> %s", op_name(s_active_op), op_name(new_op));
+    s_active_op = new_op;
+    if (new_op != AXIS_OPERATION_NONE) {
+        s_active_op_started_ms = time_ms();
+    }
+    s_joystick_quiescent_since_ms = 0u;
+}
+
+axis_operation_t axis_manager_get_active_op(void)
+{
+    return s_active_op;
+}
+
+axis_begin_result_t axis_manager_try_begin_op(axis_operation_t desired)
+{
+    if (desired == AXIS_OPERATION_NONE) return AXIS_BEGIN_REJECTED;  /* use stop_op */
+    if (s_active_op == desired) {
+        /* Same-family retarget — always allowed. Refresh quiescent tracker so
+         * a JOYSTICK that keeps arriving doesn't accidentally auto-clear. */
+        s_joystick_quiescent_since_ms = 0u;
+        return AXIS_BEGIN_CONTINUED;
+    }
+    if (s_active_op == AXIS_OPERATION_NONE) {
+        set_active_op(desired);
+        return AXIS_BEGIN_STARTED;
+    }
+    /* Cross-family conflict — reject. Operator must issue STOP first. Log at
+     * INFO so a busy panel operator can see why their command was dropped. */
+    LOG_INFO("axis_manager: %s request rejected (active_op = %s)",
+             op_name(desired), op_name(s_active_op));
+    return AXIS_BEGIN_REJECTED;
+}
+
+void axis_manager_stop_op(void)
+{
+    /* Always succeeds. Issues the appropriate motor-side stop primitive for
+     * the currently-active op then clears active_op to NONE.
+     *
+     * Deliberately best-effort on the motor-side SDO writes: if the single
+     * SDO slot is busy the abort write won't land immediately, but the
+     * higher-level state is already cleared so a competing joystick trim /
+     * shot recall waiting behind the block can proceed on the next tick.
+     * The motor will settle to safe state on its own via the cyclic stream
+     * (velocity_setpoint = 0 as soon as we exit the op) even if the SDO
+     * fell through. */
+    switch (s_active_op) {
+        case AXIS_OPERATION_HOMING:
+            abort_motor_homing_best_effort();
+            break;
+        case AXIS_OPERATION_JOYSTICK:
+            /* Zero the demand. Motor will decelerate via vel_accel_dn. */
+            s_axis.joystick_raw   = 0;
+            s_axis.joystick_value = 0.0f;
+            break;
+        case AXIS_OPERATION_SHOT_RECALL:
+            /* cmc_state owns s_next_shot; caller (cmc_state_stop_movement)
+             * clears it. Nothing to do here at the SDO level — the motor
+             * MCU stops on its own once we stop refreshing NEW_SETPOINT. */
+            break;
+        default:
+            break;
+    }
+    set_active_op(AXIS_OPERATION_NONE);
+}
+
 /* Setup snapshot (what the motor MCU has confirmed via OD_WRITE_RESP OK).
  *
  * v3: velocity_setpoint is streamed in the cyclic, not SDO-written, so it's
@@ -926,11 +1030,25 @@ static void poll_joystick_buttons(void)
         s_buttons_in_release_hold = false;
 
         if (!s_buttons_own_mode) {
-            /* First press — snapshot the current commanded mode and force
-             * JOYSTICK so downstream uses joystick_value as the demand.
-             * Route through axis_manager_set_op_mode (NOT a direct field
-             * write) so the validation, edge-detect logging, and "SDO
-             * pending" notice match every other mode change in the system.
+            /* First press — arbitrate through try_begin_op so a mid-home
+             * or mid-shot-recall button press doesn't silently abort. If
+             * REJECTED, we swallow the button and don't touch mode/value. */
+            axis_begin_result_t r = axis_manager_try_begin_op(AXIS_OPERATION_JOYSTICK);
+            if (r == AXIS_BEGIN_REJECTED) {
+                /* Log once per rejection edge — poll_joystick_buttons runs
+                 * ~1 kHz so a stuck spurious "pressed" pin would spam. Reuse
+                 * s_buttons_own_mode as the edge tracker: still false here,
+                 * so we log; the log-throttle keeps it manageable via the
+                 * "buttons engaged" absence downstream. */
+                LOG_INFO("axis_manager: buttons rejected (active_op = %s)",
+                         op_name(axis_manager_get_active_op()));
+                return;
+            }
+            /* Snapshot the current commanded mode and force JOYSTICK so
+             * downstream uses joystick_value as the demand. Route through
+             * axis_manager_set_op_mode (NOT a direct field write) so the
+             * validation, edge-detect logging, and "SDO pending" notice
+             * match every other mode change in the system.
              *
              * Also auto-enable the axis. The motor is left disabled at
              * boot (and after panel-timeout deselect) — buttons need to
@@ -1082,6 +1200,7 @@ void axis_manager_tick(void)
     poll_motor_proxy_sdo();  /* writes second (round-robin across dirty slots) */
     tick_motor_save();
     tick_home_sequencer();   /* home-to-endstop procedure + is_homed cache */
+    tick_active_op();        /* operation-level completion detection (HOMING/SHOT_RECALL/JOYSTICK -> NONE) */
 
     /* 3. Sample the on-board UP/DOWN buttons. In TORQUE mode this drives
      * target_current_a; the next step (sequencer) will pick up the new
@@ -1936,8 +2055,90 @@ bool axis_manager_encoder_is_incremental(void)
     return !s_encoder_type_known || s_encoder_is_incremental;
 }
 
+/* Body of the axis_manager_stop_op HOMING case (forward-declared near the
+ * top of the file). Sends 0x2700:8 = 0 to the motor to abort its homing
+ * routine, and forces the CMC-side sequencer back to IDLE so it stops
+ * polling. Best-effort: if the SDO slot is currently held by someone else
+ * the write silently fails and the motor's own home-timeout eventually
+ * unwinds it. */
+static void abort_motor_homing_best_effort(void)
+{
+    uint8_t zero = 0u;
+    (void)cia402_od_write_begin(0x2700u, 8u, MC_IF_T_U8, &zero, sizeof(zero));
+    s_home_seq_state         = HOME_SEQ_IDLE;
+    s_home_last_motor_status = MC_IF_HOME_IDLE;
+}
+
+/* Completion detection for the active operation. Runs once per axis_manager
+ * tick; clears s_active_op back to NONE when the current op finishes on its
+ * own terms.
+ *
+ * Kept in axis_manager (not cmc_state) so the arbitration logic lives with
+ * the state it protects; cmc_state stays a thin protocol adapter that just
+ * calls the try_begin/stop primitives. */
+#define AXIS_OP_ARRIVAL_GRACE_MS  100u  /* mirrors cmc_state ARRIVAL_GRACE_MS (ADR-033) */
+/* Definition matches the forward-declaration near the top of the file. */
+static void tick_active_op(void)
+{
+    switch (s_active_op) {
+        case AXIS_OPERATION_NONE:
+            return;
+        case AXIS_OPERATION_HOMING:
+            /* Home sequencer transitions to a terminal state; either DONE
+             * or FAILED means the operation is complete. */
+            if (s_home_seq_state == HOME_SEQ_TERMINAL_DONE
+                || s_home_seq_state == HOME_SEQ_TERMINAL_FAILED
+                || s_home_seq_state == HOME_SEQ_IDLE) {
+                set_active_op(AXIS_OPERATION_NONE);
+            }
+            return;
+        case AXIS_OPERATION_SHOT_RECALL: {
+            /* Motor reports on_target && !moving past the arrival-grace
+             * window. Same detector as cmc_state uses to clear s_next_shot. */
+            bool motor_moving    = (s_axis.movement_status & MC_IF_MOVE_MOVING)    != 0u;
+            bool motor_on_target = (s_axis.movement_status & MC_IF_MOVE_ON_TARGET) != 0u;
+            bool grace_active    = (time_elapsed_ms(s_active_op_started_ms) < AXIS_OP_ARRIVAL_GRACE_MS);
+            if (motor_on_target && !motor_moving && !grace_active) {
+                set_active_op(AXIS_OPERATION_NONE);
+            }
+            return;
+        }
+        case AXIS_OPERATION_JOYSTICK: {
+            /* Quiescent = stick centred AND motor stopped. Wait
+             * JOYSTICK_QUIESCENT_HOLD_MS of continuous quiescence before
+             * releasing so a mid-hold flap doesn't churn active_op. */
+            bool motor_moving = (s_axis.movement_status & MC_IF_MOVE_MOVING) != 0u;
+            bool stick_zero   = (s_axis.joystick_value == 0.0f);
+            if (motor_moving || !stick_zero) {
+                s_joystick_quiescent_since_ms = 0u;
+                return;
+            }
+            if (s_joystick_quiescent_since_ms == 0u) {
+                uint32_t now = time_ms();
+                s_joystick_quiescent_since_ms = (now == 0u) ? 1u : now;   /* avoid 0-sentinel */
+                return;
+            }
+            if (time_elapsed_ms(s_joystick_quiescent_since_ms) >= JOYSTICK_QUIESCENT_HOLD_MS) {
+                set_active_op(AXIS_OPERATION_NONE);
+            }
+            return;
+        }
+        default:
+            return;
+    }
+}
+
 bool axis_manager_request_home(void)
 {
+    /* Arbitration: HOMING may only start when nothing else is running.
+     * axis_manager_try_begin_op enforces the priority rules; if it returns
+     * REJECTED the sequencer stays IDLE and the caller (OD write to 0x3040)
+     * sees the false return + NOT_READY on the wire. */
+    axis_begin_result_t r = axis_manager_try_begin_op(AXIS_OPERATION_HOMING);
+    if (r == AXIS_BEGIN_REJECTED) return false;
+    /* Also refuse re-entrant home while the sequencer is mid-run — the
+     * try_begin above already caught the cross-family case; this catches
+     * the pathological "same-family retarget of a home" case. */
     if (s_home_seq_state != HOME_SEQ_IDLE) return false;
     LOG_INFO("axis: HOME start");
     /* Reset the cached motor status so POLLING_STATUS can't short-circuit

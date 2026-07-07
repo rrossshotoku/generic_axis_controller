@@ -373,6 +373,16 @@ bool cmc_state_move_to_shot(uint32_t shot_no, bool is_cut)
         return false;
     }
 
+    /* Operation arbitration. STARTED = fresh recall (first-entry path below
+     * writes op_mode + NEW_SETPOINT). CONTINUED = retarget of an in-flight
+     * recall (operator changed their mind mid-fade). REJECTED = mid-home or
+     * mid-joystick — swallow the recall, operator must STOP first. */
+    axis_begin_result_t br = axis_manager_try_begin_op(AXIS_OPERATION_SHOT_RECALL);
+    if (br == AXIS_BEGIN_REJECTED) {
+        LOG_WARN("cmc_state: shot %lu rejected: another operation in flight", (unsigned long)shot_no);
+        return false;
+    }
+
     float target = s_shots[idx].position_rad;
 
     /* Pick the duration: matches Reduced CMC cmc_state.c:358-365 precedence. */
@@ -425,6 +435,7 @@ void cmc_state_stop_movement(void)
      * the next move command. For emergency-stop, use OD 0x3011 directly
      * (still wired to axis_manager_request_quick_stop). */
     (void)axis_manager_request_halt();
+    axis_manager_stop_op();  /* clear operation arbitration; forces active_op -> NONE */
     s_moving    = false;
     s_next_shot = 0u;
     LOG_INFO("cmc_state: STOP (HALT asserted to motor)");
@@ -460,28 +471,19 @@ bool cmc_state_get_shot(uint32_t shot_no, cmc_shot_t *out)
 
 void cmc_state_handle_movement(int8_t pan)
 {
-    /* PROFILE_POSITION takes precedence over the joystick: while a CUT/FADE
-     * is mid-flight we ignore MOVEMENT frames entirely. The motor MCU
-     * continues running its trajectory to the shot uninterrupted, and the
-     * operator only regains live control once the move completes (or after
-     * a KEY_STOP, which clears s_next_shot via cmc_state_stop_movement).
-     *
-     * Gate on s_next_shot, NOT s_moving. s_moving mirrors the motor's
-     * MOVING bit (line 543) and is TRUE whenever the axis is moving —
-     * including joystick-driven motion. Gating on s_moving would make the
-     * first accepted trim start the motor, s_moving turn true, then every
-     * subsequent trim be rejected, then the watchdog fire and zero the
-     * stick, then a fresh trim be accepted... = the start-stop hitch the
-     * operator sees. s_next_shot != 0 is the correct signal that a fade
-     * or cut recall is actually in flight.
+    /* Operation arbitration (via axis_manager). CONTINUED = we're already in
+     * JOYSTICK; the trim retargets. STARTED = new joystick session; caller
+     * will drop through and set op_mode + joystick_raw. REJECTED = mid-home
+     * or mid-shot-recall; swallow the trim entirely.
      *
      * We deliberately do NOT stamp s_last_movement_ms while rejecting —
      * the watchdog stays passive, which is correct: there's nothing to
      * watchdog because no joystick input is being honoured. Logging is
-     * suppressed too to keep the log clean during multi-second fades
-     * (panels send MOVEMENT at ~25 ms intervals — 120 lines per 3 s
+     * suppressed to keep the log clean during multi-second fades (panels
+     * send MOVEMENT at ~25 ms intervals — 120 rejection lines per 3 s
      * would dominate the log). */
-    if (s_next_shot != 0u) {
+    axis_begin_result_t br = axis_manager_try_begin_op(AXIS_OPERATION_JOYSTICK);
+    if (br == AXIS_BEGIN_REJECTED) {
         return;
     }
 

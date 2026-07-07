@@ -19,6 +19,7 @@
 #include "app/config/config.h"
 #include "app/log/log.h"
 #include "app/cia402/cia402.h"
+#include "app/boot_meta/boot_meta.h"
 #include "app/od/cmc_od.h"
 #include "bsp/net/net.h"
 #include "bsp/time/time.h"
@@ -243,6 +244,18 @@ static void handle_od_read(const net_addr_t *peer, uint16_t seq,
         return;
     }
 
+    /* Bootloader OD range (0x1F50..0x1F57, owner BOOTLOADER). In app mode
+     * all reads return NOT_BOOTLOADER — the PC tool uses this as the
+     * "target is running the app, not the bootloader" signal
+     * (Documentation/dual_bootloader_design.md §4). If the CMC boots into
+     * its bootloader instead, the bootloader binary answers these reads
+     * with real data. */
+    if (idx >= 0x1F50u && idx <= 0x1F57u) {
+        send_od_read_resp(peer, seq, idx, sub, type,
+                          MC_IF_OD_ERR_NOT_BOOTLOADER, NULL, 0);
+        return;
+    }
+
     /* Motor-owned: queue to cia402, response when SPI round-trip completes. */
     if (is_retransmit_of_in_flight(peer, seq)) return;     /* drop, in-flight will reply */
     if (s_pending.in_flight) {
@@ -280,6 +293,30 @@ static void handle_od_write(const net_addr_t *peer, uint16_t seq,
     if (cmc_od_owns(idx)) {
         MC_IfOdResult_t res = cmc_od_write(idx, sub, type, payload + 5, len);
         send_od_write_resp(peer, seq, idx, sub, res);
+        return;
+    }
+
+    /* Bootloader OD range in app mode. Almost everything returns
+     * NOT_BOOTLOADER (mirror of the read guard). The one exception is
+     * 0x1F51:1 = MC_IF_PROG_START, the handshake that hands control from
+     * the app to the bootloader on next boot. On that specific write we
+     * ACK the PC tool, set the "stay in bootloader" flag, and reset. */
+    if (idx >= 0x1F50u && idx <= 0x1F57u) {
+        bool is_prog_start = (idx == 0x1F51u) && (sub == 1u)
+                          && (type == MC_IF_T_U8) && (len == 1u)
+                          && (payload[5] == MC_IF_PROG_START);
+        if (is_prog_start) {
+            /* Ack first so the PC tool sees success before we vanish. The
+             * response may or may not make it out before the reset; PC
+             * tool retries either way. */
+            send_od_write_resp(peer, seq, idx, sub, MC_IF_OD_OK);
+            boot_meta_enter_bootloader();
+            /* If boot_meta_enter_bootloader returns, the flash write
+             * failed. Send NOT_READY so the PC tool retries. */
+            send_od_write_resp(peer, seq, idx, sub, MC_IF_OD_ERR_NOT_READY);
+            return;
+        }
+        send_od_write_resp(peer, seq, idx, sub, MC_IF_OD_ERR_NOT_BOOTLOADER);
         return;
     }
 

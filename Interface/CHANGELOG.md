@@ -28,6 +28,7 @@ This is the **authoritative change history** for the shared inter-MCU boundary c
 ### Added
 - **`0x2600:11/12/13 fault_count_no_config / fault_count_not_homed / fault_count_overcurrent`** (U16 RO, motor-owned): per-fault **since-boot trigger counts** — how many times each `fault_flags` bit has *risen* (saturating, RAM only). Feeds the PC-tool Diagnostics panel (fault-counts row + a manual **Refresh** button). ADR-058.
 - **`0x2700:10 mech_zero_set_rad`** (F32 RW transient, motor-owned) + cal command **`MC_IF_CAL_SET_MECH_ZERO_AT`** (`0x2700:1 = 4`): set the mechanical zero to a *commanded* value (not just the current position), so the PC tool can capture both travel extremes (`0x2510:1`) and centre the zero on their midpoint without driving the axis there. ADR-060.
+- **`0x2300:10 jog_position_mode`** (U8 RW PERSIST, motor-owned): `0` = joystick / PROFILE_VELOCITY runs the velocity loop directly (default, unchanged); `1` = the motor integrates the velocity setpoint into a position reference and runs the position cascade, so following-error / soft-limit / stiff-hold protection apply while jogging. **Motor-side only** — the CMC still streams `velocity_setpoint`, wire unchanged. ADR-062.
 
 ### Consumers to update
 - **motor-control MCU**: implemented (motor-owned).

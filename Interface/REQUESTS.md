@@ -840,3 +840,54 @@ Phase 2 (bootloader binary) done when:
 *2026-07-03 (CMC side)*: filed as Phase 1 of the bootloader work lands. Only the wire additions are in this commit — no bootloader code exists yet on the CMC either. Phase 2 (both bootloader binaries) is a separate multi-week effort. The immediate practical impact for you is item **1** above; without it your firmware refuses any v5 SPI frame, which blocks all downstream OD traffic from the PC tool. Once you rebuild against v5, item 3's default dispatch should already handle the three new message types safely.
 
 *2026-07-03 (motor MCU, ADR-061)*: **Phase 1 (items 1–3) done.** Adopted contract v5 — added `OD_ROW_MC_IF_OWNER_BOOTLOADER` skip in `mc_od.c` (the OD X-macro otherwise fails to compile against v5, undefined owner-row for the `0x1F5x` entries), repointed the build + source include path to the moved canonical Interface, host-compiles clean against v5 (`fw_build 83`). Default message dispatch already returns `ERR_UNKNOWN_MSG` for `0x14/0x15/0x16`; node-state + result-code enums are additive. **Phase 2 (the motor bootloader binary — `0x1F5x` dispatch, segmented-SDO receiver, flash programming, reset-marker trigger, shared BSP) remains open.**
+
+*2026-07-07 (CMC side, Phase 2 status)*: **CMC bootloader binary is now written, flashed, and functional end-to-end** — the PC tool's "Update CMC firmware…" button drives the full 8-step sequence (Documentation/dual_bootloader_design.md §4). Bring-up flagged several design details that had drifted from the original plan; capturing them here so your motor-side Phase 2 doesn't repeat the same iterations. **Skim before you start coding.**
+
+### CMC-side Phase 2 — implementation decisions that differ from the original design
+
+**1. Trigger marker: FLASH not RAM.** The design doc (§5.3) originally suggested a RAM word preserved across `NVIC_SystemReset` + an alive-flag fallback for boot-loop detection. We changed to a **persistent flash marker** in its own persist page for two reasons:
+- Survives power-cycle mid-update (RAM would lose the marker → chip boots into a partially-flashed app → possibly bricked).
+- Collapses the "we asked for update" + "is the app healthy?" checks into one signal, obviating the alive-flag counter.
+
+Motor-side equivalent: pick a dedicated flash page (or reuse an existing persist region with a new field). Layout on the CMC:
+- Page 251 (`0x0807D800`) — 2 KB, holds a `persist_header_t` (16 B) + 4-byte payload magic.
+- STAY magic = `0xB007107D`.  CLEAR magic = `0x00000000`.  Anything else (including `0xFFFFFFFF` from a fresh erase) is treated as CLEAR.
+
+**2. Flag lifecycle — app clears, bootloader never touches.**
+- App receives `0x1F51:1 = MC_IF_PROG_START` → app writes STAY + `NVIC_SystemReset()` (`app/boot_meta.c:boot_meta_enter_bootloader`).
+- Bootloader reads STAY → serves firmware update. **Bootloader never writes the flag.**
+- After successful update, bootloader jumps to app (see #3 below).
+- New app runs. After `BOOT_META_HEALTHY_MS = 5000` ms of no-fault runtime, app writes CLEAR (`app/boot_meta.c:boot_meta_tick`).
+- **Brick-proof property**: if the new app crashes before 5 s, the flag stays STAY. Next reboot re-enters bootloader → operator can retry the update. No JTAG needed to unbrick.
+
+**3. PROG_COMMIT semantics — JUMP, don't RESET.** This one bit me during bring-up. Original design + REQ-0015 both say "reboot into the new image." Don't do that. Sequence:
+- If bootloader does `NVIC_SystemReset()` on COMMIT → chip reboots → bootloader reads flag (still STAY) → stays in bootloader → app never runs → flag never clears → **deadlock forever**.
+- Instead, bootloader jumps directly to the new app's Reset_Handler (same code path as the CLEAR-at-boot happy path). Flag stays STAY. App clears it after 5 s.
+- The jump sequence (`boot/main.c:boot_jump_to_app`): `__disable_irq()` → `HAL_DeInit()` → clear all NVIC interrupts → set `SCB->VTOR` to app's vector table → **`__enable_irq()`** (I hit a separate bug from missing this — HAL_Delay hangs otherwise) → `__set_MSP()` → branch.
+
+**4. PROG_VERIFY — hardware-side is a no-op; PC tool does the check locally.** The bootloader accepts VERIFY and returns OK unconditionally. The PC tool separately reads `0x1F56 program_software_id` (which the bootloader computes as a live CRC32 over the just-programmed bytes) and compares to the CRC32 of the source `.bin`. Simplifies the bootloader; the on-chip → wire round-trip is what makes the verification trustworthy. Feel free to implement VERIFY on-chip if you'd rather.
+
+**5. Segmented-SDO receiver — write-through, no buffering.** Each `MC_IF_MSG_OD_DOWNLOAD_SEGMENT` payload gets handed straight to `boot_flash_write` (which buffers only the tail dword until 8 bytes accumulate — flash program granularity). RAM usage is O(one segment) regardless of image size. This matters more for you than for the CMC since the STM32G474 has 128 KB RAM to spare, but the design assumption is worth documenting.
+
+**6. Toggle bit + last-segment handling.** Follow `INTERFACE_SPEC.md §7c`. Sender alternates toggle 0/1 across successive segments; receiver echoes the received toggle in its RESP. Toggle mismatch = the sender missed our last ack — echo their expected toggle back and don't advance the write cursor; they'll resend. `SEG_FLAG_LAST` bit closes the session cleanly.
+
+**7. Boot flag reader lives in the bootloader, duplicated header definitions.** The bootloader deliberately does NOT link the app's persist module (would drag in too many app-owned modules like axis_manager and log). Instead, `boot/boot_flag.c` duplicates the persist header format and CRC32 impl. Keep these in sync if the header ever changes — worth calling out in a comment on both sides.
+
+**8. Network config in bootloader (CMC-only concern).** The CMC bootloader reads the NETWORK persist blob so it comes up on the same IP the app was on — otherwise a PC tool at `192.1.0.101` (say) loses the CMC when the bootloader takes over at the hardcoded default `192.1.0.100`. Not relevant to you (motor is SPI, not IP-based) — flagging so you don't wonder what `boot/boot_net_cfg.c` is doing when you look at the CMC source for reference.
+
+**9. Response-then-jump ordering + drain delay.** On COMMIT, the bootloader must:
+- Send the `MC_IF_MSG_OD_WRITE_RESP` with OK first (from the same UDP dispatch that received the write).
+- Delay ~100 ms so the response drains from the W6100 TX buffer + out onto the wire.
+- Then perform the jump.
+
+We do this via a `s_commit_pending` flag polled at the tail of `boot_od_tick`. Equivalent on the SPI side would give the master a chance to see the OK before the slave vanishes into the new app.
+
+### What this means for your Phase 2 acceptance criteria
+
+Same functional outcome as before (`PROG_START` → reboot into bootloader → segmented download → verify → commit → new app runs). Just:
+
+- **Don't reset on COMMIT — jump.**
+- **Use a flash marker, not RAM** (survives power-cycle mid-update).
+- **Let the new app clear the marker** (brick-proof).
+
+Everything else is a mirror of the CMC-side implementation, adjusted for your chip / SPI transport / motor-specific flash layout. Feel free to lift the boot_flag / boot_flash / boot_seg_sdo modules almost verbatim.

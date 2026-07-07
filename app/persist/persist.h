@@ -49,6 +49,7 @@ typedef enum {
     PERSIST_REGION_CONFIG  = 0,    /* axis_manager: joystick cal + motion limits */
     PERSIST_REGION_SHOTS   = 1,    /* 100-slot CAMERAD shot table */
     PERSIST_REGION_NETWORK = 2,    /* IP / netmask / gateway / device_no */
+    PERSIST_REGION_BOOT    = 3,    /* boot_meta: "stay in bootloader on next boot" flag */
     PERSIST_REGION_COUNT
 } persist_region_t;
 
@@ -57,6 +58,7 @@ typedef enum {
 #define PERSIST_CONFIG_MAX_BYTES   (2048u - 16u)
 #define PERSIST_SHOTS_MAX_BYTES    (4096u - 16u)
 #define PERSIST_NETWORK_MAX_BYTES  (2048u - 16u)
+#define PERSIST_BOOT_MAX_BYTES     (2048u - 16u)
 
 /* No-op init for now — bsp/flash has no module-level state and the
  * persist module is stateless. Reserved for future (e.g. preloading

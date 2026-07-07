@@ -94,7 +94,8 @@ _MCFG_READOUT_KEYS = [(0x2000, 6), (0x2410, 6), (0x2400, 6), (0x2400, 7), (0x300
 _CMD_READOUT_KEYS = [(0x2300, 6), (0x2300, 7), (0x2300, 8)]   # accel ramp up / dn / jerk
 # Diagnostics group live readouts (faults + state, motor + CMC), routed to _cmd_on_state_read. (ADR-058)
 _DIAG_KEYS = [(0x2600, 1), (0x2600, 10), (0x2600, 11), (0x2600, 12), (0x2600, 13),
-              (0x6041, 0), (0x3000, 0), (0x3004, 0), (0x3005, 0), (0x3014, 0)]
+              (0x6041, 0), (0x3000, 0), (0x3004, 0), (0x3005, 0), (0x3006, 0), (0x3014, 0)]
+_ACTIVE_OP_NAME = {0: "NONE", 1: "HOMING", 2: "SHOT_RECALL", 3: "JOYSTICK"}   # MC_IF_OP_* (mc_if_od.h)
 _FAULT_COUNT_SUBS = {11: "NO_CONFIG", 12: "NOT_HOMED", 13: "OVERCURRENT"}   # 0x2600:sub -> fault name (ADR-058)
 _MOTOR_FAULT_BITS = [(0x1, "NO_CONFIG"), (0x2, "NOT_HOMED"), (0x4, "OVERCURRENT")]
 
@@ -241,6 +242,8 @@ class MainWindow(QMainWindow):
         central = QWidget()
         root = QVBoxLayout(central)
         root.addWidget(self._build_connection_bar())
+        self._build_cmd_diag()                 # persistent Diagnostics (faults & state) -- always visible
+        root.addWidget(self.cmd_diag)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_od_tree())
@@ -392,6 +395,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._scroll(self._build_rw_panel()),      "Read / Write")
         tabs.addTab(self._scroll(self._build_command_panel()), "Motor Command")
         tabs.addTab(self._build_motorcfg_panel(),              "Motor Config")
+        tabs.addTab(self._scroll(self._build_tools_panel()),   "Tools")
         tabs.addTab(self._scroll(self._build_setup_panel()),   "CMC Setup")
         tabs.addTab(self._scroll(self._build_map_panel()),     "Telemetry / Graphing")
         return tabs
@@ -767,9 +771,9 @@ class MainWindow(QMainWindow):
             limrow.addWidget(wdg)
         limrow.addStretch(1)
         fl.addRow("Soft limits (0x2600:6/7):", limrow)
-        self._build_cmd_diag()   # Diagnostics group (faults + state), ADR-058
-        # Entry-point groups in display order: position, velocity, current, tuning, feedback, diagnostics.
-        for g in (self.cmd_posg, self.cmd_velg, self.cmd_curg, self.cmd_tuneg, self.cmd_sweepg, self.cmd_fbg, self.cmd_diag):
+        # Entry-point groups: position, velocity, current, feedback. (Tuning + frequency sweep moved
+        # to the Tools tab; Diagnostics is now a persistent panel below the connection bar.)
+        for g in (self.cmd_posg, self.cmd_velg, self.cmd_curg, self.cmd_fbg):
             outer.addWidget(g)
         self._cmd_update_entry_enables()
 
@@ -1028,6 +1032,9 @@ class MainWindow(QMainWindow):
             self._diag_ec = int(res["raw"]); self._diag_update_cmc_err()
         elif key == (0x3005, 0):   # CMC error register
             self._diag_er = int(res["raw"]); self._diag_update_cmc_err()
+        elif key == (0x3006, 0):   # CMC active_operation (arbitration state)
+            op = int(res["raw"])
+            self.diag_c_op.setText(_ACTIVE_OP_NAME.get(op, f"?{op}"))
         elif key == (0x3014, 0):   # CMC auto-cleared fault count
             self.diag_c_clr.setText(str(int(res["raw"])))
 
@@ -1266,6 +1273,12 @@ class MainWindow(QMainWindow):
                               "Then click 'Save to flash' to commit it.")
         b_cfg_load.clicked.connect(self._load_config_from_file)
         btns.addWidget(b_cfg_load)
+        b_fw_update = QPushButton("Update CMC firmware…")
+        b_fw_update.setToolTip("Reboot the CMC into its bootloader, upload a new firmware .bin, verify CRC, and "
+                               "reboot into the new app. Requires the CMC to have the bootloader installed at "
+                               "0x08000000 and the app to have the Phase-2 boot handshake enabled.")
+        b_fw_update.clicked.connect(self._open_firmware_update_dialog)
+        btns.addWidget(b_fw_update)
         btns.addStretch(1)
         outer.addLayout(btns)
 
@@ -1479,6 +1492,111 @@ class MainWindow(QMainWindow):
                                + (f"\nSkipped {skipped} (not writable / not in this build's OD)." if skipped else "")
                                + "\n\nClick 'Save to flash' to commit them.")
 
+    def _open_firmware_update_dialog(self) -> None:
+        """Modal firmware-update dialog. Runs the segmented-SDO update flow
+        (Documentation/dual_bootloader_design.md §4) in a worker thread so
+        the GUI stays responsive. Progress lands in a log + progress bar."""
+        from PySide6.QtCore import QThread, Signal
+        from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QFormLayout,
+                                       QProgressBar, QPlainTextEdit, QVBoxLayout)
+        from .firmware_update import FirmwareUpdater, UpdateError, Progress
+
+        # File picker up front so we don't open a modal for nothing.
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select firmware .bin", "", "Firmware image (*.bin)")
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                image_bytes = f.read()
+        except OSError as exc:
+            QMessageBox.warning(self, "Open failed", str(exc)); return
+
+        # Resolve CMC IP from the currently-connected client (falls back to
+        # the connect dialog's last entry).
+        cmc_ip = getattr(self.client, "_addr", (None,))[0] or ""
+        if not cmc_ip:
+            QMessageBox.warning(self, "Not connected",
+                                "Connect to the CMC first — the update path re-uses the OD-access socket.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Update CMC firmware ({cmc_ip})")
+        dlg.setModal(True)
+        dlg.resize(560, 360)
+        v = QVBoxLayout(dlg)
+        form = QFormLayout()
+        lbl_file = QLabel(f"{path}  ({len(image_bytes)} bytes)")
+        form.addRow("Image:", lbl_file)
+        lbl_stage = QLabel("(waiting)")
+        lbl_stage.setStyleSheet("font-weight: bold;")
+        form.addRow("Stage:", lbl_stage)
+        v.addLayout(form)
+        pbar = QProgressBar()
+        pbar.setRange(0, max(1, len(image_bytes)))
+        v.addWidget(pbar)
+        log = QPlainTextEdit()
+        log.setReadOnly(True)
+        log.setStyleSheet("font-family: monospace; font-size: 10px;")
+        v.addWidget(log)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setEnabled(False)
+        buttons.rejected.connect(dlg.reject)
+        v.addWidget(buttons)
+
+        # --- Worker ---
+        class _Worker(QThread):
+            progress = Signal(object)
+            done = Signal(bool, str)
+
+            def __init__(self, ip: str, img: bytes):
+                super().__init__()
+                self._ip = ip
+                self._img = img
+
+            def run(self) -> None:
+                updater = FirmwareUpdater(self._ip, cb=lambda p: self.progress.emit(p))
+                try:
+                    updater.run(self._img)
+                    self.done.emit(True, "")
+                except UpdateError as e:
+                    self.done.emit(False, str(e))
+                except Exception as e:
+                    self.done.emit(False, f"Unexpected: {e!r}")
+
+        def _on_progress(p: Progress) -> None:
+            lbl_stage.setText(p.stage.upper())
+            if p.total_bytes:
+                pbar.setRange(0, p.total_bytes)
+            if p.bytes_sent:
+                pbar.setValue(p.bytes_sent)
+            if p.message:
+                log.appendPlainText(p.message)
+
+        def _on_done(ok: bool, err: str) -> None:
+            buttons.button(QDialogButtonBox.StandardButton.Close).setEnabled(True)
+            if ok:
+                log.appendPlainText("✓ complete.")
+            else:
+                log.appendPlainText(f"✗ FAILED: {err}")
+
+        # Pause the diagnostics timer so it doesn't race the update socket
+        # for the OD-access UDP port. Resumed via QTimer.singleShot on
+        # dialog close.
+        if hasattr(self, "diag_timer"):
+            self.diag_timer.stop()
+
+        worker = _Worker(cmc_ip, image_bytes)
+        worker.progress.connect(_on_progress)
+        worker.done.connect(_on_done)
+        worker.start()
+        dlg.exec()
+        worker.wait(5000)
+
+        # Restart diagnostics polling after the modal closes.
+        if hasattr(self, "diag_timer"):
+            QTimer.singleShot(1000, self.diag_timer.start)
+
     def _cmd_sweep_start(self) -> None:
         """Write the sweep params (0x2920:1-6) and start it with a clean enable 0->1 edge."""
         if not self.client.connected:
@@ -1680,11 +1798,17 @@ class MainWindow(QMainWindow):
         self.diag_c_state = QLabel("—"); self.diag_c_state.setStyleSheet("font-weight:bold;")
         self.diag_c_err   = QLabel("—")
         self.diag_c_clr   = QLabel("—")
+        self.diag_c_op    = QLabel("—"); self.diag_c_op.setStyleSheet("font-weight:bold; font-family: monospace;")
+        self.diag_c_op.setToolTip("axis_manager operation-level arbitration state (0x3006 axis_active_operation). "
+                                  "NONE = idle, any op may start. HOMING/SHOT_RECALL/JOYSTICK = that op is in "
+                                  "flight and cross-family requests will be rejected until it finishes or a "
+                                  "STOP is issued. Same-family requests pass through as retarget.")
         dgl.addRow("Motor state:", self.diag_m_state)
         dgl.addRow("Motor active faults:", self.diag_m_fault)
         dgl.addRow("Motor fault history (since boot):", self.diag_m_hist)
         dgl.addRow("Motor fault counts (since boot):", self.diag_m_counts)
         dgl.addRow("CMC state:", self.diag_c_state)
+        dgl.addRow("CMC active operation:", self.diag_c_op)
         dgl.addRow("CMC error:", self.diag_c_err)
         dgl.addRow("CMC auto-cleared faults:", self.diag_c_clr)
         d_row = QHBoxLayout()
@@ -1842,6 +1966,7 @@ class MainWindow(QMainWindow):
             (0x2300, 5),  # vel_load_factor (REQ-0014) — operator load multiplier on kp/ki
             (0x2300, 6), (0x2300, 7), (0x2300, 8),   # velocity-demand accel ramp: caps + ramp-up jerk (ADR-042)
             (0x2300, 9),   # holding_enable (U8): 1 = hold when stopped, 0 = release held current after settle (ADR-054)
+            (0x2300, 10),  # jog_position_mode (U8): 0 = direct velocity jog, 1 = position-integrated jog (ADR-062)
         ]),
         ("Current loop gains (0x2400)", [
             (0x2400, 1), (0x2400, 2), (0x2400, 3), (0x2400, 4), (0x2400, 5),
@@ -1882,6 +2007,24 @@ class MainWindow(QMainWindow):
         (0x2500, 8),                                                      # quad_counts_per_rev (quad = brushed encoder today)
     }
 
+    def _build_tools_panel(self) -> QWidget:
+        """Characterisation / tuning tools: the on-motor test signal + dq plant-ID (tuning group) and
+        the frequency sweep (resonance ID) are built by the command panel and re-parented here; the
+        inertia estimator is built here. Keeps 'commands' and 'tools' cleanly separated."""
+        w = QWidget()
+        col = QVBoxLayout(w)
+        intro = QLabel("Characterisation &amp; tuning tools — run a test to identify or tune the axis. "
+                       "The motor may move; ensure the path is clear.")
+        intro.setWordWrap(True); intro.setStyleSheet("padding:4px; color:#234;")
+        col.addWidget(intro)
+        col.addWidget(self.cmd_tuneg)
+        col.addWidget(self.cmd_sweepg)
+        col.addWidget(self._dq_group)      # plant-ID / open-loop pulse (built by Motor Config)
+        col.addWidget(self._dac_group)     # debug DAC output selector (built by Motor Config)
+        col.addWidget(self._build_inertia_estimator())
+        col.addStretch(1)
+        return w
+
     def _build_motorcfg_panel(self) -> QWidget:
         # key -> row-widget dict, for the read/write plumbing (see _cfg_row).
         self._mcfg_rows: dict[tuple[int, int], dict] = {}
@@ -1889,9 +2032,8 @@ class MainWindow(QMainWindow):
         # RO status entries (cal_status / store_status) -> their display QLabel.
         self._mcfg_status: dict[tuple[int, int], QLabel] = {}
 
-        # --- scrollable column of config groups ---
-        inner = QWidget()
-        col = QVBoxLayout(inner)
+        # --- 4 sub-tabs; each config piece is routed to its column via _cols. The bottom bar
+        #     (Read all / Save to flash) sits outside the sub-tabs so it applies to all of them. ---
         intro = QLabel(
             "Motor-controller configuration (all PERSIST) and calibration. Edit a "
             "field and click <b>Apply</b> to write it live; <b>Save to flash</b> "
@@ -1900,7 +2042,27 @@ class MainWindow(QMainWindow):
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("padding: 4px; color: #234;")
-        col.addWidget(intro)
+        subtabs = QTabWidget()
+        _cols: dict[str, QVBoxLayout] = {}
+        def _sub(name: str, title: str) -> None:
+            iw = QWidget(); c = QVBoxLayout(iw); _cols[name] = c
+            sc = QScrollArea(); sc.setWidgetResizable(True); sc.setWidget(iw)
+            subtabs.addTab(sc, title)
+        _sub("char",   "Motor characteristics")
+        _sub("loops",  "Control loops")
+        _sub("limits", "Limits & safety")
+        _sub("cal",    "Calibration")
+        _MCFG_GROUP_TAB = {
+            "Motor model (0x2000)": "char",
+            "Position loop gains (0x2200)": "loops",
+            "Velocity loop gains (0x2300)": "loops",
+            "Current loop gains (0x2400)": "loops",
+            "State estimator (0x2500)": "loops",
+            "Notch filter — current command (0x2930)": "loops",
+            "Faults / limits (0x2600)": "limits",
+            "Trajectory profile (S-curve, 0x2600:8/9)": "limits",
+            "Electrical-alignment parameters (0x2700)": "cal",
+        }
 
         # Drive backend selector (0x2000:6) -- per-board; applied at boot, so save + reboot to take effect.
         bb = QGroupBox("Drive backend")
@@ -1923,10 +2085,10 @@ class MainWindow(QMainWindow):
                                          "the persisted selection; applies on reboot.")
         bbl.addWidget(self.mcfg_backend_lbl)
         bbl.addStretch(1)
-        col.addWidget(bb)
+        _cols["char"].addWidget(bb)
 
         # Debug DAC output selector (0x2900:5 dac_source) -> PA4 / DAC1_OUT1, scaled by dac_scale (1 V/A).
-        dg = QGroupBox("Debug DAC output (PA4)")
+        self._dac_group = dg = QGroupBox("Debug DAC output (PA4)")
         dgl = QHBoxLayout(dg)
         dgl.addWidget(QLabel("Signal:"))
         self.mcfg_dac_source = QComboBox()
@@ -1941,11 +2103,11 @@ class MainWindow(QMainWindow):
         self.mcfg_dac_source.currentIndexChanged.connect(self._mcfg_set_dac_source)
         dgl.addWidget(self.mcfg_dac_source)
         dgl.addStretch(1)
-        col.addWidget(dg)
+        # dg (Debug DAC output) is re-parented to the Tools tab (plant-ID toolset)
 
         # Plant ID -- open-loop d-axis voltage pulse (ADR-046). Fires Vd for a dwell, then auto-returns to
         # 0. Energizes the motor open-loop (bypasses the CMC); scope the response on PA4.
-        pg = QGroupBox("Open-loop voltage pulse  (plant ID / drive test)")
+        self._dq_group = pg = QGroupBox("Open-loop voltage pulse  (plant ID / drive test)")
         pgl = QFormLayout(pg)
         self.dq_axis = QComboBox()
         self.dq_axis.addItem("d-axis (FOC, holds — R/L ID)", 0)
@@ -1986,7 +2148,7 @@ class MainWindow(QMainWindow):
                       "id_ss vs V — dead time (~0.9 V) biases a single point.")
         note.setWordWrap(True); note.setStyleSheet("color: #888;")
         pgl.addRow(note)
-        col.addWidget(pg)
+        # pg (plant-ID / open-loop pulse) is re-parented to the Tools tab
 
         # Homing / zeroing to a hard end stop (ADR-057) -- for incremental (quad) encoders.
         hg = QGroupBox("Home to end stop  (incremental encoder zeroing)")
@@ -2016,7 +2178,7 @@ class MainWindow(QMainWindow):
                        "(0x2500:8) and a sane velocity current limit (0x2300:4) first. Path must be clear.")
         hnote.setWordWrap(True); hnote.setStyleSheet("color: #888;")
         hgl.addRow(hnote)
-        col.addWidget(hg)
+        _cols["cal"].addWidget(hg)
         self.home_poll_timer = QTimer(self)
         self.home_poll_timer.setInterval(400)
         self.home_poll_timer.timeout.connect(self._home_poll)
@@ -2049,7 +2211,7 @@ class MainWindow(QMainWindow):
         gnote.setStyleSheet("color:#888; font-size:10px;")
         cgl.addWidget(gnote)
         cgl.addStretch(1)
-        col.addWidget(cg)
+        _cols["loops"].addWidget(cg)
 
         for group_title, keys in self._MOTORCFG_GROUPS:
             box = QGroupBox(group_title)
@@ -2085,22 +2247,19 @@ class MainWindow(QMainWindow):
                 zrow.addWidget(zbtn); zrow.addStretch(1)
                 zw = QWidget(); zw.setLayout(zrow)
                 grid.addRow("Damping ζ:", zw)
-            col.addWidget(box)
+            _cols[_MCFG_GROUP_TAB.get(group_title, "loops")].addWidget(box)
 
         self.mcfg_backend.currentIndexChanged.connect(self._apply_backend_relevance)
         self._apply_backend_relevance()   # initial gray-out for the default/selected backend (ADR-055)
-        col.addWidget(self._build_motorcfg_actions())
-        col.addWidget(self._build_inertia_estimator())
-        col.addStretch(1)
+        _cols["cal"].addWidget(self._build_motorcfg_actions())
+        for _c in _cols.values():
+            _c.addStretch(1)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(inner)
-
-        # --- persistent bottom bar (always visible, outside the scroll) ---
+        # --- bottom bar (Read all / Save to flash) outside the sub-tabs, applies to all ---
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.addWidget(scroll, 1)
+        lay.addWidget(intro)
+        lay.addWidget(subtabs, 1)
 
         bar = QHBoxLayout()
         b_read_all = QPushButton("Read all")

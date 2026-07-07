@@ -51,8 +51,43 @@ typedef enum {
     AXIS_OP_MODE_TORQUE           = MC_IF_AXIS_MODE_TORQUE,
 } axis_op_mode_t;
 
+/* Operation-level arbitration state. Layered on top of op_mode: the axis
+ * admits at most one cross-family operation at a time. Same-family requests
+ * pass through as "retarget" (a second joystick trim updates the demand; a
+ * second shot recall retargets the destination). STOP is always accepted
+ * (routes through axis_manager_stop_op regardless of state).
+ *
+ * Design intent: prevents CAMERAD MOVEMENT / shot-recall / home-start
+ * requests from overwriting each other on the SDO channel. Example: a
+ * MOVEMENT arriving mid-home used to write 0x6060 = PROFILE_VELOCITY,
+ * aborting the motor's HOMING trajectory silently. With arbitration it
+ * gets rejected + logged instead. */
+typedef enum {
+    AXIS_OPERATION_NONE        = 0,   /* idle — any op may start */
+    AXIS_OPERATION_HOMING      = 1,   /* home-to-endstop in flight */
+    AXIS_OPERATION_SHOT_RECALL = 2,   /* PROFILE_POSITION move to a shot in flight */
+    AXIS_OPERATION_JOYSTICK    = 3,   /* JOYSTICK demand active (any source) */
+} axis_operation_t;
+
+/* Result of axis_manager_try_begin_op — tells the caller whether it needs
+ * to do the first-entry setup work (e.g. SDO write of op_mode), just
+ * retarget the existing operation, or bail out entirely. */
+typedef enum {
+    AXIS_BEGIN_STARTED   = 0,   /* transitioned NONE -> op; caller does first-entry setup */
+    AXIS_BEGIN_CONTINUED = 1,   /* was already in op; caller just retargets */
+    AXIS_BEGIN_REJECTED  = 2,   /* incompatible with active op; caller must bail */
+} axis_begin_result_t;
+
 void axis_manager_init(void);
 void axis_manager_tick(void);
+
+/* Operation arbitration. Route every "start operation X" entry point through
+ * try_begin_op — the return value tells you what to do next. Route every
+ * stop (KEY_STOP, disable, quick_stop) through stop_op — it always succeeds
+ * and issues the appropriate motor-side stop primitive for the active op. */
+axis_operation_t    axis_manager_get_active_op    (void);         /* 0x3006 */
+axis_begin_result_t axis_manager_try_begin_op     (axis_operation_t desired);
+void                axis_manager_stop_op          (void);
 
 /* Motor-MCU movement_status from the v4 cyclic header (REQ-0013/ADR-033).
  *

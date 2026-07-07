@@ -42,16 +42,27 @@ _Min_Heap_Size = 0x200; /* required amount of heap */
 _Min_Stack_Size = 0x400; /* required amount of stack */
 
 /* Memories definition */
-/* FLASH LENGTH is 504 K, not the chip's full 512 K, because the top 8 K
- * (0x0807E000..0x0807FFFF) is reserved for persist regions — SHOTS at
- * 0x0807E000, CONFIG at 0x0807F000, NETWORK at 0x0807F800 (see
- * app/persist/persist.c). Reducing the FLASH region ensures the linker
- * fails at link time if the app grows into the persist pages rather than
- * silently overlapping and having persist_save erase live code. */
+/* Full G474RE flash is 512 K. The app lives at 0x08008000 immediately after
+ * the bootloader region (Phase 2 layout — dual_bootloader_design.md §5.1).
+ *
+ *   0x08000000..0x08007FFF  (32 K)  Bootloader (boot/boot_link.ld).
+ *   0x08008000..0x0807D7FF  (470 K) App code — this region.
+ *   0x0807D800..0x0807DFFF  ( 2 K)  BOOT persist (page 251) — the boot
+ *                                    flag written by app/boot_meta.c and
+ *                                    read by boot/main.c.
+ *   0x0807E000..0x0807EFFF  ( 4 K)  SHOTS persist (pages 252-253).
+ *   0x0807F000..0x0807F7FF  ( 2 K)  CONFIG persist (page 254).
+ *   0x0807F800..0x0807FFFF  ( 2 K)  NETWORK persist (page 255).
+ *
+ * On boot the CPU jumps to the bootloader's Reset_Handler at 0x08000000.
+ * The bootloader reads the BOOT flag: STAY -> serve firmware update on the
+ * network; CLEAR -> jump to the app's Reset_Handler (address stored at
+ * 0x08008004). The app's Cube-generated SystemInit relocates VTOR to
+ * 0x08008000 so its own vector table serves subsequent interrupts. */
 MEMORY
 {
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 128K
-  FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 504K
+  FLASH    (rx)    : ORIGIN = 0x8008000,   LENGTH = 470K
 }
 
 /* Sections */

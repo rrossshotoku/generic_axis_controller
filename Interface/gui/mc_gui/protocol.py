@@ -24,6 +24,10 @@ MSG_OD_WRITE_RESP = 0x04
 MSG_TLM_SUBSCRIBE = 0x10
 MSG_TLM_UNSUBSCRIBE = 0x11
 MSG_TELEMETRY = 0x20
+# v5 bootloader segmented-SDO — Documentation/dual_bootloader_design.md §3
+MSG_OD_DOWNLOAD_INIT = 0x14
+MSG_OD_DOWNLOAD_SEGMENT = 0x15
+MSG_OD_DOWNLOAD_RESP = 0x16
 MSG_ERROR = 0x7F
 
 # MC_IfOdResult_t (from mc_if_protocol.h)
@@ -97,6 +101,45 @@ def build_subscribe(seq: int, rx_port: int, rate_divider: int, batch: int) -> by
 
 def build_unsubscribe(seq: int) -> bytes:
     return pack_header(MSG_TLM_UNSUBSCRIBE, seq, b"")
+
+
+# Segmented-SDO (v5, bootloader): body layouts mirror MC_IfOdDownload*_t
+# in Interface/mc_if_protocol.h. Payload capacity per segment is bounded
+# by MC_IF_MAX_PAYLOAD - 3 == 49 bytes on the current wire; we use a
+# slightly smaller default that leaves headroom for future growth.
+SEG_DATA_MAX = 48
+SEG_FLAG_TOGGLE = 0x01
+SEG_FLAG_LAST = 0x02
+
+_DOWNLOAD_INIT = struct.Struct("<HBBI")   # index, sub, reserved, total_length
+_DOWNLOAD_RESP = struct.Struct("<BBHI")   # toggle_ack, result, reserved, bytes_accepted
+
+
+def build_download_init(seq: int, index: int, sub: int, total_length: int) -> bytes:
+    return pack_header(MSG_OD_DOWNLOAD_INIT, seq, _DOWNLOAD_INIT.pack(index, sub, 0, total_length))
+
+
+def build_download_segment(seq: int, data: bytes, toggle: int, last: bool) -> bytes:
+    """Segment body: flags(1) + reserved(1) + seg_length(1) + data[seg_length]."""
+    if len(data) > SEG_DATA_MAX:
+        raise ValueError(f"segment payload too large ({len(data)} > {SEG_DATA_MAX})")
+    flags = (SEG_FLAG_TOGGLE if toggle else 0) | (SEG_FLAG_LAST if last else 0)
+    body = struct.pack("<BBB", flags, 0, len(data)) + bytes(data)
+    return pack_header(MSG_OD_DOWNLOAD_SEGMENT, seq, body)
+
+
+@dataclass
+class DownloadResp:
+    toggle_ack: int
+    result: int
+    bytes_accepted: int
+
+
+def parse_download_resp(payload: bytes) -> DownloadResp | None:
+    if len(payload) < _DOWNLOAD_RESP.size:
+        return None
+    toggle_ack, result, _reserved, bytes_accepted = _DOWNLOAD_RESP.unpack_from(payload, 0)
+    return DownloadResp(toggle_ack, result, bytes_accepted)
 
 
 # --- response parsers ---------------------------------------------------------

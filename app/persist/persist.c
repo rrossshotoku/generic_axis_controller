@@ -7,6 +7,7 @@
  * in bsp/flash's linear numbering.
  *
  * Region addresses (must match STM32G474RETX_FLASH.ld's FLASH LENGTH cap):
+ *   PERSIST_REGION_BOOT    : 0x0807D800 .. 0x0807DFFF  (linear page 251,     2 KB)
  *   PERSIST_REGION_SHOTS   : 0x0807E000 .. 0x0807EFFF  (linear pages 252-253, 4 KB)
  *   PERSIST_REGION_CONFIG  : 0x0807F000 .. 0x0807F7FF  (linear page 254,     2 KB)
  *   PERSIST_REGION_NETWORK : 0x0807F800 .. 0x0807FFFF  (linear page 255,     2 KB)
@@ -53,6 +54,12 @@ static const region_info_t s_regions[PERSIST_REGION_COUNT] = {
         .base_page   = 255u,
         .num_pages   = 1u,                  /* 2 KB; network config (IP etc) */
         .max_payload = PERSIST_NETWORK_MAX_BYTES,
+    },
+    [PERSIST_REGION_BOOT] = {
+        .base_addr   = 0x0807D800u,
+        .base_page   = 251u,
+        .num_pages   = 1u,                  /* 2 KB; boot_meta stay-in-bootloader flag */
+        .max_payload = PERSIST_BOOT_MAX_BYTES,
     },
 };
 

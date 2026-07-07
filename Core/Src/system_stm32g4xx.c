@@ -107,7 +107,12 @@
 /*!< Uncomment the following line if you need to relocate the vector table
      anywhere in Flash or Sram, else the vector table is kept at the automatic
      remap of boot address selected */
-/* #define USER_VECT_TAB_ADDRESS */
+/* Enabled: app lives at 0x08008000, needs VTOR relocation on boot. The
+ * bootloader (dual_bootloader_design.md §5.1) is the CPU's initial entry
+ * point at 0x08000000; when it jumps to the app, the app's SystemInit
+ * must repoint SCB->VTOR to its own vector table. Bootloader builds this
+ * same file with -DVECT_TAB_OFFSET=0U to keep VTOR at 0x08000000. */
+#define USER_VECT_TAB_ADDRESS
 
 #if defined(USER_VECT_TAB_ADDRESS)
 /*!< Uncomment the following line if you need to relocate your vector Table
@@ -122,7 +127,11 @@
 #endif /* VECT_TAB_SRAM */
 
 #if !defined(VECT_TAB_OFFSET)
-#define VECT_TAB_OFFSET         0x00000000U     /*!< Vector Table offset field.
+/* App vector table lives at FLASH_BASE + 0x8000 = 0x08008000 — the 32 K
+ * region below is the bootloader (dual_bootloader_design.md §5.1).
+ * SystemInit sets SCB->VTOR to VECT_TAB_BASE_ADDRESS | VECT_TAB_OFFSET so
+ * the app's own vector table serves interrupts once it takes over. */
+#define VECT_TAB_OFFSET         0x00008000U     /*!< Vector Table offset field.
                                                      This value must be a multiple of 0x200. */
 #endif /* VECT_TAB_OFFSET */
 

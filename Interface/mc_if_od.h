@@ -130,6 +130,17 @@ typedef enum
 #define MC_IF_HOME_DONE     (2u)
 #define MC_IF_HOME_FAILED   (3u)
 
+/* ===== Active operation (0x3006 axis_active_operation, RO) =====
+ * Operation-level arbitration on the CMC. axis_manager admits at most one
+ * cross-family operation at a time; same-family requests retarget (extra
+ * joystick trims update the demand; another shot recall retargets the
+ * destination). STOP is always accepted regardless of state. See
+ * app/axis_manager for the state machine + priority rules. */
+#define MC_IF_OP_NONE         (0u)  /* idle — any operation may start */
+#define MC_IF_OP_HOMING       (1u)  /* home-to-endstop in flight */
+#define MC_IF_OP_SHOT_RECALL  (2u)  /* CUT/FADE PROFILE_POSITION move in flight */
+#define MC_IF_OP_JOYSTICK     (3u)  /* live JOYSTICK demand (from CAMERAD, PC tool, or local buttons) */
+
 /* ===== Persistence (0x2800) ===== */
 #define MC_IF_SAVE_MAGIC           (0x7376u)  /* write to 0x2800/1 to request a save */
 #define MC_IF_FACTORY_RESET_MAGIC  (0x7274u)  /* write to 0x2800/3 to request factory reset */
@@ -278,6 +289,8 @@ typedef enum
     /* Holding enable (ADR-054): 1 = hold when stopped (the PI provides whatever current is needed); 0 = */ \
     /* release the held current ~1 s after the axis settles at zero speed. Boolean -- not a current value. */ \
     X(0x2300, 9, holding_enable,              MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    /* jog_position_mode: 0 = PROFILE_VELOCITY runs the velocity loop directly (default); 1 = integrate the velocity setpoint into a position reference + run the position cascade (following-error / soft-limit / stiff-hold protection while jogging). (ADR-062) */ \
+    X(0x2300, 10, jog_position_mode,          MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2310, 1, tlm_vel_demand_rad_s,        MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2310, 2, tlm_vel_actual_rad_s,        MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2310, 3, tlm_vel_iq_cmd_a,            MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
@@ -409,6 +422,8 @@ typedef enum
     X(0x3003, 0, axis_velocity_actual,        MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     X(0x3004, 0, axis_error_code,             MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     X(0x3005, 0, axis_error_register,         MC_IF_T_U8,  MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
+    /* axis_active_operation — MC_IF_OP_* enum; operation-level arbitration state (see mc_if_od.h ~L133). */ \
+    X(0x3006, 0, axis_active_operation,       MC_IF_T_U8,  MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     /* --- 0x3010-0x301F commands (write-triggered) --- */ \
     X(0x3010, 0, axis_enable,                 MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     X(0x3011, 0, axis_quick_stop,             MC_IF_T_U8,  MC_IF_A_WO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \

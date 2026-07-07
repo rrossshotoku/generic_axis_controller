@@ -99,6 +99,7 @@ MC_IfOdResult_t cmc_od_read(uint16_t idx, uint8_t sub,
     case 0x3003: READ_F32(axis_manager_get_velocity_actual());
     case 0x3004: READ_U16(axis_manager_get_error_code());
     case 0x3005: READ_U8 (axis_manager_get_error_register());
+    case 0x3006: READ_U8 ((uint8_t)axis_manager_get_active_op());  /* MC_IF_OP_* enum */
 
     /* --- 0x3010-0x301F commands (WO) — reading these is access-denied --- */
     case 0x3010: READ_U8(0);    /* axis_enable is RW; return current latch */

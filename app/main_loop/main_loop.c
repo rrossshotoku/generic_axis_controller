@@ -25,6 +25,7 @@
 #include "app/config/config.h"
 #include "app/cia402/cia402.h"
 #include "app/axis_manager/axis_manager.h"
+#include "app/boot_meta/boot_meta.h"
 #include "app/od/od.h"
 #include "app/cmc_state/cmc_state.h"
 #include "app/controller_mgr/controller_mgr.h"
@@ -80,6 +81,11 @@ void main_loop_init(void)
         LOG_ERROR("bsp_leds_init failed (TIM1 period mismatch?) — LEDs disabled");
     }
     persist_init();
+    /* boot_meta reads the persistent "stay in bootloader" flag from the
+     * BOOT persist region. Placed immediately after persist_init so the
+     * flag's boot-time state is snapshotted before anything else runs
+     * (subsequent modules may want to log against it). */
+    boot_meta_init();
     cia402_init();
     axis_manager_init();
     led_indicator_init();
@@ -118,6 +124,11 @@ void main_loop_run(void)
         /* led_indicator_tick reads motor moving state from axis_manager and
          * link state from bsp/net, then drives bsp_leds. Cheap (~µs). */
         led_indicator_tick();
+        /* boot_meta_tick clears the "stay in bootloader" flag after
+         * BOOT_META_HEALTHY_MS of no-fault runtime. No-op on subsequent
+         * ticks once cleared, and a no-op every tick when the flag was
+         * already CLEAR at boot. */
+        boot_meta_tick();
         debug_tick();
 
         if (time_elapsed_ms(last_beat) >= HEARTBEAT_PERIOD_MS) {

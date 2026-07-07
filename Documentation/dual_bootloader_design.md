@@ -212,24 +212,56 @@ boot/                     ← new top-level folder (parallel to app/)
 `bsp/time`, same `Drivers/w6100/`. Bootloader's OD dispatch is minimal (just
 `0x1F50/1/6/7`); axis_manager, cmc_state, web, controller_mgr are all absent.
 
-### 5.3 Trigger detection (app → boot)
+### 5.3 Trigger detection (app → boot) — IMPLEMENTED as flash marker
 
-Two paths:
-1. **Soft trigger** — app receives OD write `0x1F51:1 = 0x01`; sets a marker in a
-   reserved RAM word (preserved across software reset, NOT across power cycle) or in
-   a dedicated flash word; calls `sys_reboot()`.
-2. **Hard fallback** — bootloader's `main` checks: "did the app fail to set the
-   alive flag within N seconds last boot?" If so, stay in bootloader. Protects
-   against an app that crashes immediately on startup (would otherwise loop
-   forever and never let the PC tool recover the board).
+**Design changed during implementation.** The RAM-marker + alive-flag-fallback
+sketch above was rejected in favour of a single persistent flash marker.
+Reasons:
+- A power cycle mid-update loses a RAM marker → chip boots into a
+  partially-flashed app → possibly bricked. A flash marker survives.
+- Collapses "we asked for an update" + "is the app healthy?" into one signal;
+  no separate alive-flag counter needed.
 
-### 5.4 Jump to app
+Layout:
+- Dedicated 2 KB persist page (`PERSIST_REGION_BOOT`) at `0x0807D800` on the CMC.
+  Holds a `persist_header_t` (16 B: PRST magic + version + payload_size +
+  CRC32) followed by a 4-byte payload.
+- Payload magic: `0xB007107D` = STAY, `0x00000000` = CLEAR. Anything else
+  (including `0xFFFFFFFF` from a fresh erase, or a CRC mismatch) is treated
+  as CLEAR — the bootloader falls through to jump-to-app.
 
-On a successful "commit" (or on boot with no boot-trigger):
-- Validate app image header (magic + CRC).
-- Set vector table to app's start address.
-- Set stack pointer from app's first word.
-- Jump to app's reset handler (second word).
+Lifecycle:
+1. App receives `0x1F51:1 = MC_IF_PROG_START` → app writes STAY + `NVIC_SystemReset()`
+   (`app/boot_meta.c:boot_meta_enter_bootloader`).
+2. Bootloader reads STAY on boot → serves firmware update. **Never writes the flag.**
+3. After PROG_COMMIT, bootloader jumps to app (see §5.4).
+4. App runs healthy for `BOOT_META_HEALTHY_MS = 5000` ms → app writes CLEAR
+   (`app/boot_meta.c:boot_meta_tick`).
+
+Brick-proof property: if the new app crashes before the 5 s window elapses,
+the flag stays STAY. Next reboot re-enters bootloader → operator retries.
+
+### 5.4 Jump to app — IMPLEMENTED, notes below
+
+On PROG_COMMIT (or on boot with no boot-trigger):
+- Validate app image header — pragmatic check: the initial stack pointer at
+  `APP_FLASH_BASE + 0` must be a plausible RAM address (in `0x2000_0000` range).
+  `boot/main.c:app_image_looks_valid`. No CRC check on jump-to-app itself; the
+  bootloader's PROG_VERIFY step covers image integrity for the just-uploaded
+  case, and a bad post-COMMIT jump falls into the app-fails-to-clear-the-flag
+  path which drops us back into bootloader on next reset (brick-proof).
+- Sequence in `boot/main.c:boot_jump_to_app`:
+  1. `__disable_irq()` + `HAL_DeInit()` + clear all `NVIC->ICER/ICPR`.
+  2. Set `SCB->VTOR` to `APP_FLASH_BASE` **before** re-enabling interrupts
+     so any that fire during app early-init route to the app's handlers.
+  3. `__enable_irq()` — critical. Missing this hangs the app in `HAL_Delay`
+     (SysTick never fires with PRIMASK=1). Verified empirically during
+     first-boot bring-up.
+  4. `__set_MSP(app_sp)` + branch to `app_entry`.
+
+**PROG_COMMIT is NOT a reset.** Do not `NVIC_SystemReset()` on commit — the
+flag is still STAY, so a reset loops back into the bootloader and the app
+never gets a chance to clear the flag. Jump directly. Details in §5.3.
 
 ### 5.5 Sharing code with the app
 
@@ -286,20 +318,26 @@ The web page already has the slider for load factor; the motor-update flow needs
 
 ---
 
-## 7. A/B layout decision
+## 7. A/B layout decision — DECIDED: single slot for v1
 
-**Status: open.** This is a runtime-safety decision, not a code one — the
-implementation cost is similar either way. Trade-off:
+**Status: closed 2026-07-07. Single slot.** The brick-proof property we needed
+turned out to be delivered by the flag mechanism itself (§5.3): a failed
+update leaves the flag STAY, so next boot re-enters bootloader → retry. The
+A/B rollback machinery isn't needed for that recovery path.
 
-| | Single-app-slot | A/B slots |
-|---|---|---|
-| App size budget | full | half each |
-| Update-while-running safety | none — interruption may brick | brick-proof (rollback to known-good slot) |
-| Bootloader complexity | minimal | needs slot-selection logic + "active slot" flag in a dedicated word |
-| Field recovery if brick | JTAG/SWD only | next-boot fallback |
+A/B remains an option for a future v2 if we ever want *update-while-running*
+semantics (currently out of scope — see §2 non-goals). Until then, the single
+slot buys us a bigger app budget with no operational downside.
 
-Recommendation pending the chip upgrade. Once on a chip with ≥ 256 KB flash, A/B
-is the obvious choice. Decision needed before bootloader v1 ships.
+CMC flash layout as committed:
+```
+0x08000000..0x08007FFF  (32 K)  bootloader
+0x08008000..0x0807D7FF  (470 K) app
+0x0807D800..0x0807DFFF  ( 2 K)  BOOT persist (the flag — §5.3)
+0x0807E000..0x0807EFFF  ( 4 K)  SHOTS persist
+0x0807F000..0x0807F7FF  ( 2 K)  CONFIG persist
+0x0807F800..0x0807FFFF  ( 2 K)  NETWORK persist
+```
 
 ---
 
@@ -331,19 +369,12 @@ Phase 4 — Safety hardening (after v1 ships):
 
 ---
 
-## 9. Open questions to resolve before implementation starts
+## 9. Open questions — all resolved by 2026-07-07 (Phase 2 bring-up)
 
-1. **Chip upgrade target.** STM32G474 (512 KB, same package) is the obvious choice
-   — confirm RAM + peripheral compatibility and procurement.
-2. **A/B vs single-slot** (§7).
-3. **PC tool implementation language for the segmented-SDO sender.** Python
-   `Interface/gui/` is current — Python is fine for this; ~200 lines of additional
-   code.
-4. **In-app trigger mechanism for the CMC bootloader entry** — RAM marker preserved
-   across `NVIC_SystemReset` (cheap, but lost on power cycle) vs dedicated flash word
-   (survives power cycle, costs one extra erase per update). Probably RAM marker is
-   enough: a power cycle without commit is exactly when you want the hard-fallback in
-   §5.3 to take over.
+1. **Chip upgrade target.** RESOLVED — STM32G474RETX (512 KB, same package). Confirmed by port + subsequent bring-up.
+2. **A/B vs single-slot.** RESOLVED — single slot (§7). Brick-proof property comes from the flag mechanism instead.
+3. **PC tool implementation language for the segmented-SDO sender.** RESOLVED — Python. Landed as `Interface/gui/mc_gui/firmware_update.py`.
+4. **In-app trigger mechanism.** RESOLVED — dedicated flash marker in `PERSIST_REGION_BOOT` (§5.3). Rejected the RAM marker + alive-flag combo because a flash marker gives us power-cycle safety and collapses the "asked for update" and "app is healthy" checks into one signal.
 
 ---
 
