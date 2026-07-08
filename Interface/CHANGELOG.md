@@ -23,6 +23,24 @@ This is the **authoritative change history** for the shared inter-MCU boundary c
 
 ---
 
+## [5.2.0] - 2026-07-08  (wire-breaking? no — additive CMC-owned OD entries)
+
+### Added
+- **`0x3006 axis_active_operation`** (U8 RO, CMC-owned): the currently-active operation family per the CMC's operation-level arbiter — `MC_IF_OP_NONE / _HOMING / _SHOT_RECALL / _JOYSTICK`. Same-family requests retarget through, cross-family requests are rejected until the current op completes (or STOP is issued). Exposed for observability so the PC tool + panel can show *why* a command was rejected. See `app/axis_manager` for the state machine.
+- **`0x3018 cmc_boot_request`** (U8 WO, CMC-owned): dedicated trigger for CMC-side bootloader entry. Writing `MC_IF_PROG_START (0x01)` sets the CMC's persistent BOOT_STAY flag and calls `NVIC_SystemReset()`. Frees `0x1F51:1` (`program_control`) to route unambiguously to the **motor's** bootloader via CMC-side SPI pass-through — the old app-side `0x1F51:1 = PROG_START` intercept has been removed. See `dual_bootloader_design.md` §5.3 for the flag lifecycle.
+
+### Changed (CMC-side behaviour — no wire change)
+- **`0x1F5x` reads/writes in CMC app mode now route to the motor** via `cia402_od_*_begin`. Previously the CMC's app-side OD dispatcher returned `NOT_BOOTLOADER` locally. This enables PC-tool → CMC → motor pass-through for the motor MCU's own bootloader OD (per REQ-0015 Phase 2).
+- **`MC_IF_MSG_OD_DOWNLOAD_INIT / _SEGMENT` frames received by the CMC on port 5000 are now forwarded to the motor over SPI** via a new `cia402_raw_passthrough` API — the motor's `DOWNLOAD_RESP` is forwarded back to the PC verbatim. Unchanged wire from either endpoint's perspective; the CMC becomes a transparent SPI hop.
+- **CMC pauses cyclic commands (emits HEARTBEATs instead)** when it sees `node_state == MC_IF_NODE_BOOTLOADER` in the motor's cyclic status. Bootloader doesn't handle CiA-402 semantics so we suppress the commands rather than confuse it.
+
+### Consumers to update
+- **motor-control MCU**: none — both OD entries are CMC-owned; the pass-through changes are internal to the CMC's dispatcher. Motor bootloader continues to receive the same `0x1F5x` and `DOWNLOAD_*` frames it already implements per REQ-0015.
+- **network MCU** (this project): implemented in commits `91406e4` (contract + dispatch + arbiter) and its parents.
+- **PC tool**: firmware-update dialog now takes a target selector (CMC vs Motor MCU); wire messages are unchanged.
+
+---
+
 ## [5.1.0] - 2026-07-03  (wire-breaking? no — additive motor-owned OD entries)
 
 ### Added

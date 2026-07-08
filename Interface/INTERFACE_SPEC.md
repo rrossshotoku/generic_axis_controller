@@ -334,6 +334,23 @@ Both MCUs are addressed identically — the PC tool's "Update firmware" flow is 
 7. Read      0x1F56  (confirm new CRC now running)
 ```
 
+### 7f. CMC-target vs Motor-target disambiguation (v5.2)
+
+The wire has one `0x1F5x` OD range, but the PC tool needs to say *which* MCU it means when talking to the CMC. Since the CMC is the only network endpoint, PROG_START can't rely on IP to pick a target.
+
+Convention:
+
+| PC tool intent      | OD entry to write          | Behaviour                                                                                                                                                                     |
+|---------------------|----------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Update the **CMC**  | `0x3018 cmc_boot_request`  | CMC-owned entry. Writing `MC_IF_PROG_START` sets the CMC's persistent BOOT_STAY flag + issues `NVIC_SystemReset()`.                                                            |
+| Update the **motor** | `0x1F51:1 program_control` | CMC's app-side OD dispatcher routes any `0x1F5x` read/write to the motor over SPI via `cia402_od_*_begin`. Motor's app-side handler for `0x1F51:1 = PROG_START` triggers the motor's bootloader entry per REQ-0015. |
+
+All subsequent flow steps (`DOWNLOAD_INIT / _SEGMENT`, `PROG_VERIFY`, `PROG_COMMIT`, `0x1F56` CRC readback) are transport-agnostic — the CMC forwards them to the motor over SPI transparently once the motor is in bootloader mode. Wire messages are identical; only the CMC's routing table differs by target.
+
+`MC_IF_MSG_OD_DOWNLOAD_INIT / _SEGMENT / _RESP` frames received by the CMC on UDP port 5000 are forwarded to the motor over SPI verbatim using a `cia402` raw-passthrough API. The motor's `DOWNLOAD_RESP` is unwrapped from SPI and forwarded to the PC tool over UDP with the original `sequence` echoed — the PC tool correlates responses by seq without needing to know that a CMC hop happened.
+
+While the CMC's cyclic status shows `node_state == MC_IF_NODE_BOOTLOADER` from the motor, the CMC pauses its normal `CYCLIC_CMD` frames (emits `HEARTBEAT` instead) and pauses its app-side motor-OD polling. This prevents motor-app-only OD reads (`0x2600 fault_flags`, `0x2500 quad_counts_per_rev`, `0x2300 vel_load_factor`, etc.) from being fired at a bootloader that doesn't implement them — the sub-modules would deadlock on unpolled COMPLETE handles. Normal polling resumes on the falling edge back to a non-bootloader `node_state`.
+
 ## Open point (still confirm)
 
 - Whether to add configurable PDO mapping (host chooses which entries stream) vs the fixed

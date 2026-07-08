@@ -138,7 +138,9 @@ class FirmwareUpdater:
             raise UpdateError(f"read 0x{idx:04X}:{sub} — no response")
         hdr, payload = resp
         r = proto.parse_read_resp(payload)
-        if r is None or r.result != proto.OD_OK:
+        if r is None:
+            raise UpdateError(f"read 0x{idx:04X}:{sub} — malformed/short reply")
+        if r.result != proto.OD_OK:
             raise UpdateError(f"read 0x{idx:04X}:{sub} rejected (result=0x{r.result:02X})")
         if len(r.data) < 4:
             raise UpdateError(f"read 0x{idx:04X}:{sub} short payload")
@@ -151,7 +153,9 @@ class FirmwareUpdater:
             raise UpdateError(f"read 0x{idx:04X}:{sub} — no response")
         hdr, payload = resp
         r = proto.parse_read_resp(payload)
-        if r is None or r.result != proto.OD_OK:
+        if r is None:
+            raise UpdateError(f"read 0x{idx:04X}:{sub} — malformed/short reply")
+        if r.result != proto.OD_OK:
             raise UpdateError(f"read 0x{idx:04X}:{sub} rejected (result=0x{r.result:02X})")
         return struct.unpack("<H", r.data[:2])[0]
 

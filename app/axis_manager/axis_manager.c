@@ -14,6 +14,36 @@
  *    NEW_SETPOINT bit when start_move is pulsed and the setup is fully
  *    applied. JOYSTICK mode streams joystick_value directly; the motor MCU
  *    applies it live without needing the trigger.
+ *
+ * === Table of contents (line numbers approximate — see grep for exact) ===
+ *
+ *   ~100  Module state (s_axis + friends)
+ *   ~170  Operation-level arbitration state (JOYSTICK / SHOT_RECALL / HOMING)
+ *   ~330  Scaling helpers (unit conversion)
+ *   ~445  Persistence (blob save/load, PERSIST_REGION_CONFIG co-tenants)
+ *   ~540  Lifecycle (axis_manager_init)
+ *   ~610  Desired-setup snapshot (clamp/scale before SDO)
+ *   ~650  SDO setup-sequencer (one-in-flight write pipeline)
+ *   ~820  Cyclic command composition
+ *   ~920  axis_manager_tick — main entry point
+ *   ~950  On-board UP/DOWN button poll + JOYSTICK-mode jog
+ *  ~1240  State getters (backing 0x30xx RO OD entries)
+ *  ~1260  Command latches (enable/quick_stop/clear_fault/start_move)
+ *  ~1305  Mode + targets (backing 0x3020..0x302A RW OD entries)
+ *  ~1440  Limits + calibration (backing 0x303x)
+ *  ~1500  Load-factor SDO helper
+ *  ~1565  Motor-proxy SDO writes (vel_accel_* + motor-save shared handle)
+ *  ~1700  Motor-proxy bootsync (SDO-read each accel param on first start)
+ *  ~1848  Motor-save sequencer (disable → SDO save → re-enable)
+ *  ~1975  Home-to-endstop sequencer + is_homed cache + encoder-type detect
+ *
+ * TODO — future refactor: extract home_sequencer, motor_save, and
+ * bootsync into their own .c files under app/axis_manager/. Each is a
+ * self-contained state machine with its own statics; moving them out
+ * would shrink this file to ~1500 lines. Deferred: they touch each
+ * other + reset_motor_od_submodules touches all their statics on the
+ * motor-in-bootloader edge, so extraction needs a small internal header
+ * and Makefile updates. Not urgent — the file is well-sectioned above.
  */
 
 #include "axis_manager.h"
