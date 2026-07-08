@@ -66,6 +66,55 @@ bool cia402_od_poll(cia402_od_handle_t h,
                     void *out_data, uint8_t *out_len);
 
 /*----------------------------------------------------------------------------
+ * Raw passthrough — used by the CMC-side firmware-update path to forward
+ * arbitrary mc_if messages to the motor MCU (specifically the segmented-SDO
+ * messages MC_IF_MSG_OD_DOWNLOAD_INIT / _SEGMENT and receive the matching
+ * DOWNLOAD_RESP). Shares the same single-slot pipeline as the OD API — only
+ * one raw or OD transaction can be in flight at a time.
+ *
+ * Semantics are identical to OD read/write:
+ *   1. cia402_raw_passthrough_begin returns a handle (or INVALID if the slot
+ *      is busy / payload too big).
+ *   2. cia402_raw_passthrough_poll(h) returns false until the response has
+ *      arrived (or timed out), then true — after which the slot is free
+ *      for the next begin.
+ *
+ * out_msg_type on success is whatever mc_if message type the motor replied
+ * with (typically MC_IF_MSG_OD_DOWNLOAD_RESP). out_result is set to OK on a
+ * clean round-trip; NOT_READY on timeout; other results only if the motor
+ * itself emitted an ERROR frame matching our seq.
+ *---------------------------------------------------------------------------*/
+
+cia402_od_handle_t cia402_raw_passthrough_begin(uint8_t tx_msg_type,
+                                                const void *tx_payload,
+                                                uint8_t tx_len);
+
+bool cia402_raw_passthrough_poll(cia402_od_handle_t h,
+                                 MC_IfOdResult_t *out_result,
+                                 uint8_t *out_msg_type,
+                                 void *out_payload, uint8_t *out_len);
+
+/*----------------------------------------------------------------------------
+ * Bootloader-mode observability + emergency abort
+ *
+ * cia402_motor_in_bootloader — returns true once the motor MCU has reported
+ * MC_IF_NODE_BOOTLOADER in a cyclic status header. The CMC's app-side
+ * axis_manager uses this to pause its per-tick motor-OD polling; those OD
+ * entries (fault_flags, encoder cpr, load_factor, ...) don't exist in the
+ * motor's bootloader, and firing them while in bootloader mode would leave
+ * sub-modules holding stale handles and deadlock the OD slot.
+ *
+ * cia402_od_abort — force the s_od slot back to OD_IDLE regardless of
+ * current state. Any handle held by an upper layer becomes stale
+ * (subsequent cia402_od_poll returns false). Called by axis_manager on
+ * the rising edge of "motor entered bootloader" so PC-tool OD writes to
+ * 0x1F5x (bootloader OD range, forwarded via cia402_raw_passthrough) don't
+ * have to wait for an in-flight axis_manager request to complete.
+ *---------------------------------------------------------------------------*/
+bool cia402_motor_in_bootloader(void);
+void cia402_od_abort(void);
+
+/*----------------------------------------------------------------------------
  * Latest cyclic status accessor (polled by app/od).
  *
  * Returns true and copies out the most recent CYCLIC_STATUS header + blob

@@ -1273,10 +1273,12 @@ class MainWindow(QMainWindow):
                               "Then click 'Save to flash' to commit it.")
         b_cfg_load.clicked.connect(self._load_config_from_file)
         btns.addWidget(b_cfg_load)
-        b_fw_update = QPushButton("Update CMC firmware…")
-        b_fw_update.setToolTip("Reboot the CMC into its bootloader, upload a new firmware .bin, verify CRC, and "
-                               "reboot into the new app. Requires the CMC to have the bootloader installed at "
-                               "0x08000000 and the app to have the Phase-2 boot handshake enabled.")
+        b_fw_update = QPushButton("Update firmware…")
+        b_fw_update.setToolTip("Reboot the target (CMC or motor MCU) into its bootloader, upload a new firmware "
+                               ".bin, verify CRC, and jump into the new app. CMC target requires the CMC's Phase-2 "
+                               "bootloader installed at 0x08000000. Motor target additionally requires the motor "
+                               "MCU's own bootloader (per REQ-0015 Phase 2) — until that lands, the motor path "
+                               "will hit BAD_VERSION / NOT_BOOTLOADER during PROG_START forwarding.")
         b_fw_update.clicked.connect(self._open_firmware_update_dialog)
         btns.addWidget(b_fw_update)
         btns.addStretch(1)
@@ -1498,8 +1500,10 @@ class MainWindow(QMainWindow):
         the GUI stays responsive. Progress lands in a log + progress bar."""
         from PySide6.QtCore import QThread, Signal
         from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QFormLayout,
-                                       QProgressBar, QPlainTextEdit, QVBoxLayout)
-        from .firmware_update import FirmwareUpdater, UpdateError, Progress
+                                       QProgressBar, QPlainTextEdit, QVBoxLayout,
+                                       QRadioButton, QButtonGroup)
+        from .firmware_update import (FirmwareUpdater, UpdateError, Progress,
+                                      TARGET_CMC, TARGET_MOTOR)
 
         # File picker up front so we don't open a modal for nothing.
         path, _ = QFileDialog.getOpenFileName(
@@ -1521,13 +1525,25 @@ class MainWindow(QMainWindow):
             return
 
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"Update CMC firmware ({cmc_ip})")
+        dlg.setWindowTitle(f"Update firmware ({cmc_ip})")
         dlg.setModal(True)
-        dlg.resize(560, 360)
+        dlg.resize(560, 400)
         v = QVBoxLayout(dlg)
         form = QFormLayout()
         lbl_file = QLabel(f"{path}  ({len(image_bytes)} bytes)")
         form.addRow("Image:", lbl_file)
+        # Target selector — CMC by default. Motor path uses the CMC as SPI
+        # passthrough to the motor's own bootloader.
+        rb_cmc   = QRadioButton("CMC")
+        rb_motor = QRadioButton("Motor MCU (via CMC passthrough)")
+        rb_cmc.setChecked(True)
+        target_group = QButtonGroup(dlg)
+        target_group.addButton(rb_cmc)
+        target_group.addButton(rb_motor)
+        from PySide6.QtWidgets import QHBoxLayout as _QHB
+        row = _QHB()
+        row.addWidget(rb_cmc); row.addWidget(rb_motor); row.addStretch(1)
+        form.addRow("Target:", row)
         lbl_stage = QLabel("(waiting)")
         lbl_stage.setStyleSheet("font-weight: bold;")
         form.addRow("Stage:", lbl_stage)
@@ -1539,7 +1555,8 @@ class MainWindow(QMainWindow):
         log.setReadOnly(True)
         log.setStyleSheet("font-family: monospace; font-size: 10px;")
         v.addWidget(log)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Close)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Start")
         buttons.button(QDialogButtonBox.StandardButton.Close).setEnabled(False)
         buttons.rejected.connect(dlg.reject)
         v.addWidget(buttons)
@@ -1549,13 +1566,15 @@ class MainWindow(QMainWindow):
             progress = Signal(object)
             done = Signal(bool, str)
 
-            def __init__(self, ip: str, img: bytes):
+            def __init__(self, ip: str, img: bytes, target: str):
                 super().__init__()
                 self._ip = ip
                 self._img = img
+                self._target = target
 
             def run(self) -> None:
-                updater = FirmwareUpdater(self._ip, cb=lambda p: self.progress.emit(p))
+                updater = FirmwareUpdater(self._ip, target=self._target,
+                                          cb=lambda p: self.progress.emit(p))
                 try:
                     updater.run(self._img)
                     self.done.emit(True, "")
@@ -1586,12 +1605,23 @@ class MainWindow(QMainWindow):
         if hasattr(self, "diag_timer"):
             self.diag_timer.stop()
 
-        worker = _Worker(cmc_ip, image_bytes)
-        worker.progress.connect(_on_progress)
-        worker.done.connect(_on_done)
-        worker.start()
+        worker_ref = {"w": None}
+        def _start() -> None:
+            if worker_ref["w"] is not None:
+                return
+            target = TARGET_MOTOR if rb_motor.isChecked() else TARGET_CMC
+            rb_cmc.setEnabled(False); rb_motor.setEnabled(False)
+            buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(False)
+            log.appendPlainText(f"Target: {target.upper()}")
+            w = _Worker(cmc_ip, image_bytes, target)
+            w.progress.connect(_on_progress)
+            w.done.connect(_on_done)
+            worker_ref["w"] = w
+            w.start()
+        buttons.button(QDialogButtonBox.StandardButton.Ok).clicked.connect(_start)
         dlg.exec()
-        worker.wait(5000)
+        if worker_ref["w"] is not None:
+            worker_ref["w"].wait(5000)
 
         # Restart diagnostics polling after the modal closes.
         if hasattr(self, "diag_timer"):

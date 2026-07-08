@@ -12,6 +12,7 @@
 #include "cmc_od.h"
 
 #include "app/axis_manager/axis_manager.h"
+#include "app/boot_meta/boot_meta.h"
 #include "app/cmc_state/cmc_state.h"
 #include "app/led_indicator/led_indicator.h"
 #include "app/log/log.h"
@@ -309,6 +310,18 @@ static MC_IfOdResult_t cmc_od_write_inner(uint16_t idx, uint8_t sub,
     /* --- 0x3014 axis_auto_fault_clears (U16 RO) — diagnostic counter --- */
     case 0x3014:
         return MC_IF_OD_ERR_ACCESS;
+
+    /* --- 0x3018 cmc_boot_request (U8 WO) — enter CMC-side bootloader --- */
+    case 0x3018:
+        sz = check_write_size(MC_IF_T_U8, in_len); if (sz != MC_IF_OD_OK) return sz;
+        if (in_type != MC_IF_T_U8)            return MC_IF_OD_ERR_TYPE;
+        if (get_u8(in_data) != MC_IF_PROG_START) return MC_IF_OD_ERR_RANGE;
+        LOG_INFO("cmc_od: 0x3018 cmc_boot_request = PROG_START -> entering bootloader");
+        /* boot_meta_enter_bootloader writes the STAY flag then NVIC_SystemReset()s;
+         * it may or may not return (if the flash write fails, it returns and we
+         * hand back NOT_READY so the PC tool retries). */
+        boot_meta_enter_bootloader();
+        return MC_IF_OD_ERR_NOT_READY;
 
     /* --- 0x3020 axis_op_mode (U8 RW) --- */
     case 0x3020:

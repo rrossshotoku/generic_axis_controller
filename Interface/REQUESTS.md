@@ -891,3 +891,14 @@ Same functional outcome as before (`PROG_START` → reboot into bootloader → s
 - **Let the new app clear the marker** (brick-proof).
 
 Everything else is a mirror of the CMC-side implementation, adjusted for your chip / SPI transport / motor-specific flash layout. Feel free to lift the boot_flag / boot_flash / boot_seg_sdo modules almost verbatim.
+
+*2026-07-07 (motor side, Phase 2 status)*: **Motor bootloader is written — code-complete, host-compiles, NOT yet flashed/verified on target.** Implemented per the nine decisions above (ADR-064 in Generic_motor_controller). **Action for the CMC/network side: wire up the PC-tool → CMC → motor pass-through** so the existing "Update firmware…" flow can target the motor node. Motor-side specifics the pass-through should know:
+
+- **Transport:** the motor bootloader is an SPI **slave** using the *same* frame format as the app (`MC_IfFrameHeader_t` + CRC16-Modbus, `MC_IF_FRAME_SIZE` = 64). No wire/OD change — the CMC forwards the existing `OD_READ/WRITE` + `OD_DOWNLOAD_INIT/SEGMENT` frames unchanged; only the OD range answered differs (0x1F5x while `CYCLIC_STATUS.node_state == MC_IF_NODE_BOOTLOADER` = 0x07).
+- **Pipelining:** the bootloader stages its response on the **next** transaction (same pipelined-by-one model as the app's `mc_comms`). The CMC master already correlates by `sequence`, so no change — just don't expect the response in the same transaction that carried the request.
+- **Enter bootloader:** `OD_WRITE(0x1F51:1 = PROG_START)` to the motor → the app writes STAY + resets; the motor reappears in bootloader mode within a boot cycle. Other 0x1F5x writes to the *app* now return `MC_IF_OD_ERR_NOT_BOOTLOADER` (0x0C).
+- **Flash map:** app relocated to 0x08008800; bootloader 0x08000000 (32K); boot-flag page 0x08008000; config A/B (bank2 pg126/127) untouched by updates. Provisioning flashes `boot.bin`@0x08000000 + `<app>.bin`@0x08008800 once via SWD (see `Generic_motor_controller/boot/README.md`).
+- **VERIFY:** on-chip is a no-op; the PC tool reads `0x1F56` (live CRC32 over the programmed bytes) and compares to the `.bin` CRC, exactly like the CMC path.
+- **Segment sizing:** motor accepts up to `MC_IF_MAX_PAYLOAD − 3` = 49 data bytes/segment (64 B frame). Same as the CMC.
+
+Open: on-target bring-up on the motor board (`make -C boot`, flash, run the end-to-end checklist in `boot/README.md`).

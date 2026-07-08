@@ -924,6 +924,7 @@ static void compose_cyclic_cmd(MC_IfCyclicCommand_t *out)
 /* Defined further down in the load-factor accessor block. Forward-declared
  * here so axis_manager_tick can drain the pending SDO write each cycle. */
 static void poll_load_factor_sdo(void);
+static void reset_motor_od_submodules(void);   /* body near end of file — after all statics are declared */
 /* Forward decls for the proxy + motor-save sequencer (defined right after
  * load_factor). Both run every tick to keep their state machines alive.
  * proxy_motor_f32_begin is also forward-declared so the limit-setters
@@ -1195,11 +1196,34 @@ void axis_manager_tick(void)
      * the new vel_accel_* + motor-save sequencer share a single proxy
      * handle (only one of the three can be in flight at a time, which is
      * fine because they're operator-driven and low-rate). */
-    poll_load_factor_sdo();
-    tick_proxy_bootsync();   /* reads first (no-op once complete) */
-    poll_motor_proxy_sdo();  /* writes second (round-robin across dirty slots) */
-    tick_motor_save();
-    tick_home_sequencer();   /* home-to-endstop procedure + is_homed cache */
+    /* Pause all motor-OD sub-modules while the motor MCU is in its
+     * bootloader (dual_bootloader_design.md §6). The bootloader doesn't
+     * implement fault_flags / vel_load_factor / cpr / motor_save / etc.,
+     * so firing OD requests to those entries from here would leave the
+     * sub-modules holding stale handles (motor bootloader replies with
+     * NO_OBJECT or similar; the sub-modules' state machines don't expect
+     * that mid-operation) and would deadlock the cia402 OD slot — which
+     * blocks the PC tool's bootloader OD writes too. On the rising edge
+     * of "motor entered bootloader" we abort any in-flight OD to release
+     * whatever sub-module handle was held. */
+    static bool s_prev_motor_in_bl = false;
+    bool motor_in_bl = cia402_motor_in_bootloader();
+    if (motor_in_bl && !s_prev_motor_in_bl) {
+        LOG_INFO("axis_manager: motor entered bootloader — pausing motor-OD sub-modules + aborting in-flight OD");
+        cia402_od_abort();
+        reset_motor_od_submodules();
+    } else if (!motor_in_bl && s_prev_motor_in_bl) {
+        LOG_INFO("axis_manager: motor left bootloader — resuming motor-OD sub-modules");
+    }
+    s_prev_motor_in_bl = motor_in_bl;
+
+    if (!motor_in_bl) {
+        poll_load_factor_sdo();
+        tick_proxy_bootsync();   /* reads first (no-op once complete) */
+        poll_motor_proxy_sdo();  /* writes second (round-robin across dirty slots) */
+        tick_motor_save();
+        tick_home_sequencer();   /* home-to-endstop procedure + is_homed cache */
+    }
     tick_active_op();        /* operation-level completion detection (HOMING/SHOT_RECALL/JOYSTICK -> NONE) */
 
     /* 3. Sample the on-board UP/DOWN buttons. In TORQUE mode this drives
@@ -2021,6 +2045,30 @@ static uint32_t           s_last_enctype_read_ms  = 0;    /* 0 = never */
  *           directly, or motor reset mid-session) doesn't leave us stale. */
 #define FAULT_READ_RETRY_MS   500u
 #define FAULT_READ_REFRESH_MS 5000u
+
+/* Force every motor-OD-touching sub-module back to its IDLE / start state.
+ * Called from axis_manager_tick on the rising edge of
+ * "cia402_motor_in_bootloader" so the sub-modules don't come back to life
+ * mid-request when the motor jumps back to app mode — they'd be holding
+ * stale cia402 handles at that point. Placed HERE (after all sub-module
+ * statics are declared) — forward-declared prototype near the top of the
+ * file so axis_manager_tick can call it. */
+static void reset_motor_od_submodules(void)
+{
+    s_home_seq_state         = HOME_SEQ_IDLE;
+    s_home_seq_handle        = CIA402_OD_HANDLE_INVALID;
+    s_home_last_motor_status = MC_IF_HOME_IDLE;
+    s_bootsync_state         = BOOTSYNC_IDLE;
+    s_bootsync_handle        = CIA402_OD_HANDLE_INVALID;
+    /* bootsync gets a full restart when motor returns to app — a firmware
+     * update may have changed the motor's OD contents, so cached proxy
+     * slots must be re-mirrored. */
+    s_bootsync_next_slot     = 0;
+    s_motor_save_state       = MOTOR_SAVE_IDLE;
+    s_motor_save_handle      = CIA402_OD_HANDLE_INVALID;
+    s_load_factor_handle     = CIA402_OD_HANDLE_INVALID;
+    s_proxy_handle           = CIA402_OD_HANDLE_INVALID;
+}
 
 uint8_t axis_manager_get_home_status(void)
 {

@@ -89,15 +89,25 @@ static struct {
     od_state_t          state;
     cia402_od_handle_t  handle;
     bool                is_read;
+    /* Raw passthrough (segmented SDO forwarding). When true, tx_msg_type is
+     * used verbatim in build_frame; the SDO index/sub/type fields above are
+     * ignored. Response is captured regardless of msg_type. Cleared back to
+     * false whenever begin() opens a regular OD transaction. */
+    bool                is_raw;
+    uint8_t             tx_msg_type;
     uint16_t            index;
     uint8_t             subindex;
     MC_IfOdType_t       type;
-    uint8_t             tx_data[8];
+    /* Sized to hold a MC_IF_MSG_OD_DOWNLOAD_SEGMENT body (3 header bytes +
+     * up to 49 data bytes = 52). Regular OD read/write bodies use just the
+     * first few bytes; unused tail is zero-filled. */
+    uint8_t             tx_data[MC_IF_MAX_PAYLOAD];
     uint8_t             tx_data_len;
     uint16_t            req_seq;
     uint32_t            deadline_ms;
     MC_IfOdResult_t     result;
-    uint8_t             resp_data[8];
+    uint8_t             resp_msg_type;
+    uint8_t             resp_data[MC_IF_MAX_PAYLOAD];
     uint8_t             resp_data_len;
 } s_od;
 
@@ -236,6 +246,22 @@ static void send_od_write_req(uint16_t seq)
     s_od.deadline_ms = time_ms() + OD_RESPONSE_TIMEOUT_MS;
 }
 
+/* Raw passthrough — the OD slot is holding an arbitrary mc_if frame to send
+ * verbatim (segmented-SDO forwarding for the motor's bootloader). The tx
+ * payload was copied into s_od.tx_data by cia402_raw_passthrough_begin. */
+static void send_raw_passthrough(uint16_t seq)
+{
+    build_frame(s_od.tx_msg_type, seq, s_od.tx_data, s_od.tx_data_len);
+    s_od.req_seq     = seq;
+    s_od.state       = OD_AWAITING;
+    /* Segmented-SDO INIT triggers a multi-second erase on the motor
+     * bootloader — bump the deadline for that specific case. Regular
+     * segments respond within the usual OD timeout budget. */
+    uint32_t timeout = (s_od.tx_msg_type == MC_IF_MSG_OD_DOWNLOAD_INIT)
+                     ? 10000u : OD_RESPONSE_TIMEOUT_MS;
+    s_od.deadline_ms = time_ms() + timeout;
+}
+
 /*----------------------------------------------------------------------------
  * Response handlers
  *---------------------------------------------------------------------------*/
@@ -269,6 +295,23 @@ static void complete_od(MC_IfOdResult_t result, const uint8_t *data, uint8_t dat
         memcpy(s_od.resp_data, data, s_od.resp_data_len);
     }
     s_od.state = OD_COMPLETE;
+}
+
+/* Response capture for raw passthrough: keep the msg_type + full payload so
+ * the caller can forward the reply to the PC tool verbatim. */
+static void handle_raw_passthrough_resp(uint8_t msg_type,
+                                        const uint8_t *payload, uint16_t plen,
+                                        uint16_t rx_seq)
+{
+    if (s_od.state != OD_AWAITING || !s_od.is_raw) return;
+    if (rx_seq != s_od.req_seq) return;
+    s_od.resp_msg_type = msg_type;
+    uint8_t n = (plen > sizeof(s_od.resp_data))
+              ? (uint8_t)sizeof(s_od.resp_data) : (uint8_t)plen;
+    if (n > 0) memcpy(s_od.resp_data, payload, n);
+    s_od.resp_data_len = n;
+    s_od.result        = MC_IF_OD_OK;
+    s_od.state         = OD_COMPLETE;
 }
 
 static void handle_od_read_resp(const uint8_t *payload, uint16_t plen, uint16_t rx_seq)
@@ -361,11 +404,22 @@ void cia402_tick(void)
     }
 
     /* Compose the next frame. OD request takes precedence over cyclic
-     * (it preempts one cyclic cycle, per the Interface model). */
+     * (it preempts one cyclic cycle, per the Interface model).
+     *
+     * When the motor's last cyclic status reported node_state == BOOTLOADER,
+     * the motor's bootloader binary is running — it doesn't understand
+     * CiA-402 cyclic commands (controlword, velocity_setpoint, etc.) and
+     * would reject them. Emit a HEARTBEAT instead so we still clock the SPI
+     * link + get any pending OD/passthrough response back on the MISO. */
     uint16_t seq = ++s_sequence;
+    bool motor_in_bootloader = s_status_ever
+                            && (s_status_hdr.node_state == MC_IF_NODE_BOOTLOADER);
     if (s_od.state == OD_REQ_PENDING) {
-        if (s_od.is_read) send_od_read_req(seq);
-        else              send_od_write_req(seq);
+        if      (s_od.is_raw)  send_raw_passthrough(seq);
+        else if (s_od.is_read) send_od_read_req(seq);
+        else                   send_od_write_req(seq);
+    } else if (motor_in_bootloader) {
+        build_frame(MC_IF_MSG_HEARTBEAT, seq, NULL, 0);
     } else {
         send_cyclic_cmd(seq);
     }
@@ -389,6 +443,10 @@ void cia402_tick(void)
                     break;
                 case MC_IF_MSG_OD_WRITE_RESP:
                     handle_od_write_resp(v.payload, v.plen, v.seq);
+                    break;
+                case MC_IF_MSG_OD_DOWNLOAD_RESP:
+                    /* Motor-bootloader reply to a passthrough INIT/SEGMENT. */
+                    handle_raw_passthrough_resp(v.msg_type, v.payload, v.plen, v.seq);
                     break;
                 case MC_IF_MSG_ERROR:
                     handle_error(v.payload, v.plen);
@@ -426,6 +484,7 @@ cia402_od_handle_t cia402_od_read_begin(uint16_t idx, uint8_t sub, MC_IfOdType_t
 
     s_od.handle   = alloc_handle();
     s_od.is_read  = true;
+    s_od.is_raw   = false;
     s_od.index    = idx;
     s_od.subindex = sub;
     s_od.type     = type;
@@ -442,6 +501,7 @@ cia402_od_handle_t cia402_od_write_begin(uint16_t idx, uint8_t sub, MC_IfOdType_
 
     s_od.handle   = alloc_handle();
     s_od.is_read  = false;
+    s_od.is_raw   = false;
     s_od.index    = idx;
     s_od.subindex = sub;
     s_od.type     = type;
@@ -449,6 +509,61 @@ cia402_od_handle_t cia402_od_write_begin(uint16_t idx, uint8_t sub, MC_IfOdType_
     if (len > 0) memcpy(s_od.tx_data, data, len);
     s_od.state    = OD_REQ_PENDING;
     return s_od.handle;
+}
+
+cia402_od_handle_t cia402_raw_passthrough_begin(uint8_t tx_msg_type,
+                                                const void *tx_payload,
+                                                uint8_t tx_len)
+{
+    if (!s_initialised || s_od.state != OD_IDLE) return CIA402_OD_HANDLE_INVALID;
+    if (tx_len > sizeof(s_od.tx_data) || (tx_len > 0 && tx_payload == NULL)) {
+        return CIA402_OD_HANDLE_INVALID;
+    }
+    s_od.handle       = alloc_handle();
+    s_od.is_raw       = true;
+    s_od.is_read      = false;
+    s_od.tx_msg_type  = tx_msg_type;
+    s_od.tx_data_len  = tx_len;
+    if (tx_len > 0) memcpy(s_od.tx_data, tx_payload, tx_len);
+    s_od.state        = OD_REQ_PENDING;
+    return s_od.handle;
+}
+
+bool cia402_raw_passthrough_poll(cia402_od_handle_t h,
+                                 MC_IfOdResult_t *out_result,
+                                 uint8_t *out_msg_type,
+                                 void *out_payload, uint8_t *out_len)
+{
+    if (h == CIA402_OD_HANDLE_INVALID || h != s_od.handle) return false;
+    if (s_od.state != OD_COMPLETE) return false;
+    if (out_result)   *out_result   = s_od.result;
+    if (out_msg_type) *out_msg_type = s_od.resp_msg_type;
+    if (out_payload && out_len) {
+        uint8_t cap = *out_len;
+        uint8_t n   = (s_od.resp_data_len < cap) ? s_od.resp_data_len : cap;
+        if (n > 0) memcpy(out_payload, s_od.resp_data, n);
+        *out_len = n;
+    }
+    s_od.state  = OD_IDLE;
+    s_od.handle = CIA402_OD_HANDLE_INVALID;
+    return true;
+}
+
+bool cia402_motor_in_bootloader(void)
+{
+    /* s_status_ever gates against pre-first-status: on a fresh boot before
+     * the motor has said anything, s_status_hdr is zero-init and would look
+     * like node_state == INIT — but we haven't heard from the motor at all,
+     * so we shouldn't claim it's in bootloader either. */
+    return s_status_ever && (s_status_hdr.node_state == MC_IF_NODE_BOOTLOADER);
+}
+
+void cia402_od_abort(void)
+{
+    s_od.state       = OD_IDLE;
+    s_od.handle      = CIA402_OD_HANDLE_INVALID;
+    s_od.is_raw      = false;
+    s_od.tx_data_len = 0;
 }
 
 bool cia402_od_poll(cia402_od_handle_t h,

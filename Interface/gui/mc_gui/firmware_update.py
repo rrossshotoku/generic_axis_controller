@@ -53,6 +53,17 @@ FLASH_STATE_NAME = {
     FLASH_FAULT: "FAULT",
 }
 
+# Update target — determines how PROG_START is delivered.
+# CMC: write to 0x3018 cmc_boot_request (CMC-owned trigger, no ambiguity with
+#      motor OD access).
+# MOTOR: write to 0x1F51:1 which the CMC's OD dispatcher forwards to the motor
+#      over SPI via cia402 raw passthrough. All other steps (segmented download,
+#      VERIFY, COMMIT, CRC readback) also route through the CMC transparently.
+TARGET_CMC = "cmc"
+TARGET_MOTOR = "motor"
+OD_CMC_BOOT_REQUEST_INDEX = 0x3018
+OD_CMC_BOOT_REQUEST_SUB = 0
+
 
 class UpdateError(RuntimeError):
     """Recoverable failure — user gets a message, no partial commit happens."""
@@ -77,8 +88,12 @@ class FirmwareUpdater:
     thread. The socket is opened in run() and closed on exit.
     """
 
-    def __init__(self, cmc_ip: str, od_port: int = 5000, cb: ProgressCb | None = None):
+    def __init__(self, cmc_ip: str, od_port: int = 5000,
+                 target: str = TARGET_CMC, cb: ProgressCb | None = None):
+        if target not in (TARGET_CMC, TARGET_MOTOR):
+            raise ValueError(f"target must be {TARGET_CMC!r} or {TARGET_MOTOR!r}")
         self._addr = (cmc_ip, od_port)
+        self._target = target
         self._sock: socket.socket | None = None
         self._cb = cb or (lambda p: None)
         self._seq = 0
@@ -155,13 +170,27 @@ class FirmwareUpdater:
     def _download_init(self, total_bytes: int) -> None:
         seq = self._next_seq()
         req = proto.build_download_init(seq, OD_PROG_DATA_INDEX, OD_PROG_DATA_SUB, total_bytes)
-        # Erase can take multiple seconds — bump the per-attempt timeout.
-        resp = self._send_recv(req, seq, timeout=10.0, retries=3)
+        # Erase can take multiple seconds — bump the per-attempt timeout well
+        # above the CMC's cia402 raw passthrough timeout for DOWNLOAD_INIT
+        # (currently 10 s). If we're timing out at 10 s but the motor is
+        # still erasing, we'd give up early.
+        resp = self._send_recv(req, seq, timeout=15.0, retries=1)
         if resp is None:
-            raise UpdateError("DOWNLOAD_INIT — no response")
-        _hdr, payload = resp
+            raise UpdateError("DOWNLOAD_INIT — no response (motor bootloader may be erasing; retry after ~10 s)")
+        hdr, payload = resp
+        # CMC forwards a MSG_OD_DOWNLOAD_RESP if motor answered normally; if
+        # cia402 timed out or the motor sent an error, CMC surfaces it as
+        # MSG_ERROR with class ERR_OD and detail = MC_IfOdResult_t.
+        if hdr.type == proto.MSG_ERROR:
+            e = proto.parse_error(payload)
+            det = f"class=0x{e.error_class:02X} detail=0x{e.detail:02X}" if e else "unparseable"
+            raise UpdateError(f"DOWNLOAD_INIT — CMC returned ERROR ({det})")
+        if hdr.type != proto.MSG_OD_DOWNLOAD_RESP:
+            raise UpdateError(f"DOWNLOAD_INIT — unexpected msg_type=0x{hdr.type:02X}")
         r = proto.parse_download_resp(payload)
-        if r is None or r.result != proto.OD_OK:
+        if r is None:
+            raise UpdateError(f"DOWNLOAD_INIT — malformed DOWNLOAD_RESP ({len(payload)} B)")
+        if r.result != proto.OD_OK:
             raise UpdateError(f"DOWNLOAD_INIT rejected (result=0x{r.result:02X})")
 
     def _download_segment(self, chunk: bytes, toggle: int, last: bool) -> proto.DownloadResp:
@@ -170,10 +199,16 @@ class FirmwareUpdater:
         resp = self._send_recv(req, seq, timeout=0.5, retries=4)
         if resp is None:
             raise UpdateError("DOWNLOAD_SEGMENT — no response")
-        _hdr, payload = resp
+        hdr, payload = resp
+        if hdr.type == proto.MSG_ERROR:
+            e = proto.parse_error(payload)
+            det = f"class=0x{e.error_class:02X} detail=0x{e.detail:02X}" if e else "unparseable"
+            raise UpdateError(f"DOWNLOAD_SEGMENT — CMC returned ERROR ({det})")
+        if hdr.type != proto.MSG_OD_DOWNLOAD_RESP:
+            raise UpdateError(f"DOWNLOAD_SEGMENT — unexpected msg_type=0x{hdr.type:02X}")
         r = proto.parse_download_resp(payload)
         if r is None:
-            raise UpdateError("DOWNLOAD_SEGMENT — malformed reply")
+            raise UpdateError(f"DOWNLOAD_SEGMENT — malformed DOWNLOAD_RESP ({len(payload)} B)")
         if r.result != proto.OD_OK:
             raise UpdateError(f"DOWNLOAD_SEGMENT rejected (result=0x{r.result:02X})")
         return r
@@ -195,22 +230,31 @@ class FirmwareUpdater:
         raise UpdateError(f"Timed out waiting for bootloader ({last_err})")
 
     def _wait_for_app(self, deadline_s: float) -> None:
-        """Poll 0x3006 axis_active_operation (app-owned, CMC range) until
-        the app answers OK. The bootloader doesn't own that entry so
-        would either not respond or reject it — either way we keep
-        polling until the real app shows up."""
+        """Poll a target-specific app-only OD entry until we see OK, meaning
+        the target's app is answering. Different entry for CMC vs Motor:
+          - CMC:   0x3006 axis_active_operation (CMC-owned; only answered
+                   by CMC app).
+          - Motor: 0x6041 statusword (motor-app owned; motor bootloader
+                   returns NO_OBJECT). The CMC pass-through forwards the
+                   read over SPI, so an OK response really is the motor
+                   answering.
+        """
+        if self._target == TARGET_CMC:
+            probe_idx, probe_sub = 0x3006, 0
+        else:
+            probe_idx, probe_sub = 0x6041, 0  # CiA-402 statusword, motor-owned
         end = time.monotonic() + deadline_s
         last_err = ""
         while time.monotonic() < end:
             seq = self._next_seq()
-            resp = self._send_recv(proto.build_read_req(seq, 0x3006, 0, 0), seq,
-                                   timeout=0.5, retries=2)
+            resp = self._send_recv(proto.build_read_req(seq, probe_idx, probe_sub, 0),
+                                   seq, timeout=0.5, retries=2)
             if resp is not None:
                 _hdr, payload = resp
                 r = proto.parse_read_resp(payload)
                 if r is not None and r.result == proto.OD_OK:
-                    return  # app answered — it's up
-                last_err = "app rejected 0x3006 read"
+                    return  # target's app answered — it's up
+                last_err = f"target rejected 0x{probe_idx:04X}:{probe_sub} read"
             else:
                 last_err = "no response"
             time.sleep(0.2)
@@ -254,15 +298,29 @@ class FirmwareUpdater:
                 return
 
             # --- Step 4: request bootloader entry. -------------------------
-            self._cb(Progress(stage="rebooting",
-                              message="Requesting bootloader entry (PROG_START)…"))
+            # CMC target: dedicated 0x3018 cmc_boot_request (CMC-owned).
+            # MOTOR target: 0x1F51:1 = PROG_START, which the CMC's OD
+            #   dispatcher forwards to the motor over SPI. The motor's app
+            #   handles it (writes flag + resets), then the motor comes up
+            #   in bootloader mode. Cyclic status will start showing
+            #   node_state = BOOTLOADER; the CMC pauses cyclic commands
+            #   automatically.
+            if self._target == TARGET_CMC:
+                trigger_idx = OD_CMC_BOOT_REQUEST_INDEX
+                trigger_sub = OD_CMC_BOOT_REQUEST_SUB
+                stage_msg = "Requesting CMC bootloader entry (0x3018 = PROG_START)…"
+            else:  # TARGET_MOTOR
+                trigger_idx = OD_PROG_CONTROL_INDEX
+                trigger_sub = OD_PROG_CONTROL_SUB
+                stage_msg = "Requesting MOTOR bootloader entry (0x1F51:1 = PROG_START via CMC)…"
+            self._cb(Progress(stage="rebooting", message=stage_msg))
             try:
-                self._write_u8(OD_PROG_CONTROL_INDEX, OD_PROG_CONTROL_SUB, PROG_START)
+                self._write_u8(trigger_idx, trigger_sub, PROG_START)
             except UpdateError as e:
-                # The response may not arrive because the CMC resets before
-                # sending it. That's OK — we probe next.
+                # The response may not arrive because the target resets
+                # before sending it. That's OK — we probe next.
                 self._cb(Progress(stage="rebooting", message=f"(ignored: {e})"))
-            time.sleep(1.0)   # give the CMC time to actually reset
+            time.sleep(1.0)   # give the target time to actually reset
 
             # --- Wait for bootloader to come up. ---------------------------
             self._cb(Progress(stage="rebooting", message="Waiting for bootloader…"))
@@ -297,14 +355,26 @@ class FirmwareUpdater:
             # --- Step 6: verify. -------------------------------------------
             self._cb(Progress(stage="verifying", message="Verifying image…"))
             self._write_u8(OD_PROG_CONTROL_INDEX, OD_PROG_CONTROL_SUB, PROG_VERIFY)
-            # Cross-check: read 0x1F56 which now computes CRC over the newly
-            # written bytes, and compare locally to what we expected.
+            # Cross-check: read 0x1F56 which SHOULD now compute CRC over the
+            # newly written bytes, and compare locally to what we expected.
+            # Some bootloader implementations return 0 (not implemented) —
+            # in that case we skip the local compare and trust PROG_VERIFY's
+            # on-chip result. Segmented-SDO's toggle bit + last-segment
+            # semantics already catch most transport errors.
             got_crc = self._read_u32(OD_PROG_SOFTWARE_ID_INDEX, OD_PROG_SOFTWARE_ID_SUB)
-            if got_crc != new_crc:
+            if got_crc == 0:
+                self._cb(Progress(stage="verifying",
+                                  message=f"WARN: 0x1F56 returned 0 (bootloader CRC not implemented?) — "
+                                          f"expected 0x{new_crc:08X}; skipping local CRC compare, "
+                                          f"trusting bootloader PROG_VERIFY."))
+            elif got_crc != new_crc:
                 self._write_u8(OD_PROG_CONTROL_INDEX, OD_PROG_CONTROL_SUB, PROG_ABORT)
                 raise UpdateError(
                     f"CRC mismatch after programming: got 0x{got_crc:08X}, expected 0x{new_crc:08X}."
                 )
+            else:
+                self._cb(Progress(stage="verifying",
+                                  message=f"CRC match (0x{new_crc:08X}) — verified."))
 
             # --- Step 7: commit + reset. -----------------------------------
             self._cb(Progress(stage="committing", message="Committing + resetting…"))

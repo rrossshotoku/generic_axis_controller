@@ -19,7 +19,6 @@
 #include "app/config/config.h"
 #include "app/log/log.h"
 #include "app/cia402/cia402.h"
-#include "app/boot_meta/boot_meta.h"
 #include "app/od/cmc_od.h"
 #include "bsp/net/net.h"
 #include "bsp/time/time.h"
@@ -48,14 +47,19 @@
 #define TELEMETRY_KEEPALIVE_MS        1000u
 
 typedef enum {
-    MSG_OD_READ_REQ      = 0x01,
-    MSG_OD_READ_RESP     = 0x02,
-    MSG_OD_WRITE_REQ     = 0x03,
-    MSG_OD_WRITE_RESP    = 0x04,
-    MSG_TLM_SUBSCRIBE    = 0x10,
-    MSG_TLM_UNSUBSCRIBE  = 0x11,
-    MSG_TELEMETRY        = 0x20,
-    MSG_ERROR            = 0x7F,
+    MSG_OD_READ_REQ         = 0x01,
+    MSG_OD_READ_RESP        = 0x02,
+    MSG_OD_WRITE_REQ        = 0x03,
+    MSG_OD_WRITE_RESP       = 0x04,
+    MSG_TLM_SUBSCRIBE       = 0x10,
+    MSG_TLM_UNSUBSCRIBE     = 0x11,
+    /* v5 bootloader segmented-SDO (dual_bootloader_design.md §3). The CMC
+     * forwards these to the motor MCU verbatim via cia402 raw passthrough. */
+    MSG_OD_DOWNLOAD_INIT    = 0x14,
+    MSG_OD_DOWNLOAD_SEGMENT = 0x15,
+    MSG_OD_DOWNLOAD_RESP    = 0x16,
+    MSG_TELEMETRY           = 0x20,
+    MSG_ERROR               = 0x7F,
 } udp_msg_type_t;
 
 /* error_class values per Interface/mc_if_protocol.h MC_IfErrorClass_t. The
@@ -78,7 +82,12 @@ typedef enum {
  *---------------------------------------------------------------------------*/
 
 /* One in-flight OD request at a time. Phase 4 may widen via a queue inside
- * cia402; until then a single slot suffices and keeps the logic obvious. */
+ * cia402; until then a single slot suffices and keeps the logic obvious.
+ *
+ * When is_raw is true, this is a segmented-SDO passthrough (DOWNLOAD_INIT or
+ * _SEGMENT forwarded to the motor bootloader). The idx/sub/type fields are
+ * ignored; response is a MC_IF_MSG_OD_DOWNLOAD_RESP that gets forwarded to
+ * the PC tool verbatim. */
 typedef struct {
     bool                in_flight;
     cia402_od_handle_t  handle;
@@ -88,6 +97,7 @@ typedef struct {
     uint8_t             sub;
     MC_IfOdType_t       type;
     bool                is_read;
+    bool                is_raw;      /* true = segmented-SDO passthrough */
 } pending_od_t;
 
 typedef struct {
@@ -244,17 +254,12 @@ static void handle_od_read(const net_addr_t *peer, uint16_t seq,
         return;
     }
 
-    /* Bootloader OD range (0x1F50..0x1F57, owner BOOTLOADER). In app mode
-     * all reads return NOT_BOOTLOADER — the PC tool uses this as the
-     * "target is running the app, not the bootloader" signal
-     * (Documentation/dual_bootloader_design.md §4). If the CMC boots into
-     * its bootloader instead, the bootloader binary answers these reads
-     * with real data. */
-    if (idx >= 0x1F50u && idx <= 0x1F57u) {
-        send_od_read_resp(peer, seq, idx, sub, type,
-                          MC_IF_OD_ERR_NOT_BOOTLOADER, NULL, 0);
-        return;
-    }
+    /* Bootloader OD range (0x1F50..0x1F57, owner BOOTLOADER) in app mode
+     * unambiguously targets the MOTOR — the CMC-side bootloader is entered
+     * via the dedicated 0x3018 cmc_boot_request entry instead. So these
+     * reads fall through to the motor-SPI path below. The motor's app
+     * returns NOT_BOOTLOADER; the motor's bootloader (once implemented per
+     * REQ-0015 Phase 2) returns real data. */
 
     /* Motor-owned: queue to cia402, response when SPI round-trip completes. */
     if (is_retransmit_of_in_flight(peer, seq)) return;     /* drop, in-flight will reply */
@@ -296,29 +301,10 @@ static void handle_od_write(const net_addr_t *peer, uint16_t seq,
         return;
     }
 
-    /* Bootloader OD range in app mode. Almost everything returns
-     * NOT_BOOTLOADER (mirror of the read guard). The one exception is
-     * 0x1F51:1 = MC_IF_PROG_START, the handshake that hands control from
-     * the app to the bootloader on next boot. On that specific write we
-     * ACK the PC tool, set the "stay in bootloader" flag, and reset. */
-    if (idx >= 0x1F50u && idx <= 0x1F57u) {
-        bool is_prog_start = (idx == 0x1F51u) && (sub == 1u)
-                          && (type == MC_IF_T_U8) && (len == 1u)
-                          && (payload[5] == MC_IF_PROG_START);
-        if (is_prog_start) {
-            /* Ack first so the PC tool sees success before we vanish. The
-             * response may or may not make it out before the reset; PC
-             * tool retries either way. */
-            send_od_write_resp(peer, seq, idx, sub, MC_IF_OD_OK);
-            boot_meta_enter_bootloader();
-            /* If boot_meta_enter_bootloader returns, the flash write
-             * failed. Send NOT_READY so the PC tool retries. */
-            send_od_write_resp(peer, seq, idx, sub, MC_IF_OD_ERR_NOT_READY);
-            return;
-        }
-        send_od_write_resp(peer, seq, idx, sub, MC_IF_OD_ERR_NOT_BOOTLOADER);
-        return;
-    }
+    /* Bootloader OD range (0x1F50..0x1F57) in CMC app mode routes to the
+     * motor over SPI — same rule as reads. The CMC-side bootloader is
+     * entered via 0x3018 cmc_boot_request (see app/od/cmc_od.c), not
+     * this range. Falls through to the motor-SPI path below. */
 
     /* Motor-owned: queue to cia402, response when SPI round-trip completes. */
     if (is_retransmit_of_in_flight(peer, seq)) return;
@@ -384,13 +370,45 @@ static void handle_unsubscribe(const net_addr_t *peer, uint16_t seq)
  * Pending-request completion (Phase 5: completes immediately with NOT_READY)
  *---------------------------------------------------------------------------*/
 
+/* Build + send a raw msg-type frame (used to forward DOWNLOAD_RESP verbatim
+ * from the motor MCU to the PC tool). */
+static void send_raw_frame(const net_addr_t *peer, uint16_t seq,
+                           uint8_t msg_type, const uint8_t *payload, uint16_t plen)
+{
+    uint8_t out[UDP_HDR_BYTES + MC_IF_MAX_PAYLOAD];
+    if (plen > MC_IF_MAX_PAYLOAD) plen = MC_IF_MAX_PAYLOAD;
+    build_hdr(out, msg_type, seq, plen);
+    if (plen > 0 && payload != NULL) memcpy(out + UDP_HDR_BYTES, payload, plen);
+    (void)net_sendto(OD_ACCESS_SOCKET, peer, out, (size_t)(UDP_HDR_BYTES + plen));
+}
+
 static void service_pending(void)
 {
     if (!s_pending.in_flight) return;
 
     MC_IfOdResult_t res    = MC_IF_OD_OK;
-    uint8_t         buf[8] = {0};
-    uint8_t         vlen   = sizeof(buf);
+
+    if (s_pending.is_raw) {
+        uint8_t buf[MC_IF_MAX_PAYLOAD] = {0};
+        uint8_t vlen = sizeof(buf);
+        uint8_t msg_type = 0;
+        if (!cia402_raw_passthrough_poll(s_pending.handle, &res,
+                                          &msg_type, buf, &vlen)) return;
+        if (res == MC_IF_OD_OK) {
+            /* Forward the motor's DOWNLOAD_RESP body verbatim. */
+            send_raw_frame(&s_pending.peer, s_pending.seq, msg_type, buf, vlen);
+        } else {
+            /* Timeout or motor-side error — surface as ERR_OD so the PC
+             * tool's segmented-SDO sender treats it as retryable/fatal
+             * based on the detail byte. */
+            send_error(&s_pending.peer, s_pending.seq, ERR_OD, (uint8_t)res);
+        }
+        s_pending.in_flight = false;
+        return;
+    }
+
+    uint8_t buf[8] = {0};
+    uint8_t vlen   = sizeof(buf);
 
     if (!cia402_od_poll(s_pending.handle, &res, buf, &vlen)) return;
 
@@ -404,6 +422,28 @@ static void service_pending(void)
     }
 
     s_pending.in_flight = false;
+}
+
+/* Forward a segmented-SDO INIT or SEGMENT to the motor over SPI via cia402
+ * raw passthrough. Response (DOWNLOAD_RESP) is captured by service_pending. */
+static void handle_od_download_passthrough(const net_addr_t *peer, uint16_t seq,
+                                           uint8_t msg_type,
+                                           const uint8_t *payload, uint16_t plen)
+{
+    if (is_retransmit_of_in_flight(peer, seq)) return;
+    if (s_pending.in_flight) {
+        send_error(peer, seq, ERR_INTERNAL, ERR_DETAIL_QUEUE_FULL);
+        return;
+    }
+    cia402_od_handle_t h = cia402_raw_passthrough_begin(msg_type, payload, (uint8_t)plen);
+    if (h == CIA402_OD_HANDLE_INVALID) {
+        send_error(peer, seq, ERR_INTERNAL, ERR_DETAIL_QUEUE_FULL);
+        return;
+    }
+    s_pending = (pending_od_t){
+        .in_flight = true, .handle = h, .peer = *peer, .seq = seq,
+        .idx = 0, .sub = 0, .type = 0, .is_read = false, .is_raw = true,
+    };
 }
 
 /*----------------------------------------------------------------------------
@@ -434,11 +474,15 @@ static void service_access_socket(void)
     const uint8_t *payload = buf + UDP_HDR_BYTES;
 
     switch (type) {
-        case MSG_OD_READ_REQ:     handle_od_read    (&from, seq, payload, plen); break;
-        case MSG_OD_WRITE_REQ:    handle_od_write   (&from, seq, payload, plen); break;
-        case MSG_TLM_SUBSCRIBE:   handle_subscribe  (&from, seq, payload, plen); break;
-        case MSG_TLM_UNSUBSCRIBE: handle_unsubscribe(&from, seq);                break;
-        default:                  send_error(&from, seq, ERR_UNKNOWN_MSG, type); break;
+        case MSG_OD_READ_REQ:         handle_od_read              (&from, seq, payload, plen); break;
+        case MSG_OD_WRITE_REQ:        handle_od_write             (&from, seq, payload, plen); break;
+        case MSG_TLM_SUBSCRIBE:       handle_subscribe            (&from, seq, payload, plen); break;
+        case MSG_TLM_UNSUBSCRIBE:     handle_unsubscribe          (&from, seq);                break;
+        case MSG_OD_DOWNLOAD_INIT:
+        case MSG_OD_DOWNLOAD_SEGMENT: handle_od_download_passthrough(&from, seq,
+                                                                     (uint8_t)type,
+                                                                     payload, plen); break;
+        default:                      send_error(&from, seq, ERR_UNKNOWN_MSG, type); break;
     }
 }
 

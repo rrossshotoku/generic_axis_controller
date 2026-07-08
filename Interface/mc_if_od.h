@@ -434,6 +434,12 @@ typedef enum
      * RO, U16, since-boot only (not persisted) — increments each time the \
      * 5 s timer fires whether or not the clear actually succeeds. */ \
     X(0x3014, 0, axis_auto_fault_clears,      MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
+    /* cmc_boot_request — WO trigger for the CMC-side bootloader entry. Write */ \
+    /* MC_IF_PROG_START (0x01) to have the CMC set its persistent BOOT_STAY   */ \
+    /* flag + reset itself. The old 0x1F51:1=PROG_START intercept was removed */ \
+    /* so 0x1F5x access unambiguously targets the MOTOR (via SPI passthrough) */ \
+    /* while this entry unambiguously targets the CMC.                        */ \
+    X(0x3018, 0, cmc_boot_request,            MC_IF_T_U8,  MC_IF_A_WO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     /* --- 0x3020-0x302F mode + per-mode targets --- */ \
     X(0x3020, 0, axis_op_mode,                MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     X(0x3021, 0, axis_joystick_value,         MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
