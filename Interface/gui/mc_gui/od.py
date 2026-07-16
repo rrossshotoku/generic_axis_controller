@@ -78,6 +78,7 @@ _UNIT_BY_NAME = {
     "max_accel_rad_s2": "rad/s^2",
     "vel_accel_up": "rad/s^2", "vel_accel_dn": "rad/s^2", "vel_accel_jerk": "rad/s^3",
     "hb_cur_bandwidth": "rad/s",
+    "thermal_tau_s": "s",   # thermal_i_cont_a gets "A" from the _a suffix heuristic (ADR-065)
 }
 
 # Entries shown as hex (bitfields / CiA error codes), keyed by (index, sub) — NOT whole

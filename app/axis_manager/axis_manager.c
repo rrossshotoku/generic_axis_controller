@@ -193,6 +193,11 @@ typedef struct {
      * fixed header so the CMC always has them, independent of the
      * host-configurable telemetry-map content. */
     uint16_t         movement_status;
+
+    /* Operator-settable, persisted. When 1, axis_manager fires a home
+     * command once per boot as soon as the motor's encoder type is known
+     * and reports incremental. 0 = never auto-home. Backs 0x3043. */
+    uint8_t          home_on_boot;
 } axis_t;
 
 static axis_t s_axis;
@@ -490,8 +495,12 @@ static float current_velocity_demand_rad_s(void)
  * v4 (2026-06-26): appended 3 bytes of LED indicator colour (R/G/B) — see
  * app/led_indicator. The blob remains operator-tunables only; we co-locate
  * here rather than spinning up a 4th persist region for 3 bytes (the
- * existing CONFIG region is the only one with spare layout headroom). */
-#define AXIS_PERSIST_VERSION   5u
+ * existing CONFIG region is the only one with spare layout headroom).
+ *
+ * v6 (2026-07-09): appended 1 byte home_on_boot (0x3043). Boards with a v5
+ * blob get rejected → fall through to defaults (home_on_boot = 0, no
+ * behaviour change). Operator re-Saves to migrate. */
+#define AXIS_PERSIST_VERSION   6u
 
 typedef struct __attribute__((packed)) {
     float    joystick_max_velocity;
@@ -505,6 +514,7 @@ typedef struct __attribute__((packed)) {
     float    accel_limit_rad_s2;
     uint8_t  led_rgb[3];                 /* v4: led_indicator colour */
     uint8_t  axis_role;                  /* v5: 0x3070 CAMERAD_AXIS_* bitmap */
+    uint8_t  home_on_boot;               /* v6: 0x3043 axis_home_on_boot */
 } axis_persist_blob_t;
 
 static void apply_persist_blob(const axis_persist_blob_t *b)
@@ -529,6 +539,9 @@ static void apply_persist_blob(const axis_persist_blob_t *b)
      * so the CMC still processes MOVEMENT frames after a corrupted save. */
     s_axis.axis_role = b->axis_role;
     if (s_axis.axis_role == 0u) s_axis.axis_role = 0x01u;  /* PAN default */
+    /* v6: home_on_boot. Sanitize to 0 or 1 in case a partially-corrupted
+     * blob loaded through the CRC (unlikely but cheap). */
+    s_axis.home_on_boot = (b->home_on_boot != 0u) ? 1u : 0u;
     led_indicator_apply_persist(b->led_rgb);
     recompute_joystick_max_velocity();
 }
@@ -549,6 +562,7 @@ static void capture_persist_blob(axis_persist_blob_t *b)
     b->accel_limit_rad_s2    = s_axis.accel_limit_rad_s2;
     led_indicator_capture_persist(b->led_rgb);
     b->axis_role = s_axis.axis_role;
+    b->home_on_boot = s_axis.home_on_boot;
 }
 
 bool axis_manager_save_to_flash(void)
@@ -1395,6 +1409,17 @@ bool    axis_manager_set_joy_profile(uint8_t p)
     }
     s_axis.joy_profile = p;
     recompute_joystick_max_velocity();
+    return true;
+}
+
+uint8_t axis_manager_get_home_on_boot(void) { return s_axis.home_on_boot; }
+bool    axis_manager_set_home_on_boot(uint8_t v)
+{
+    uint8_t nv = (v != 0u) ? 1u : 0u;
+    if (s_axis.home_on_boot != nv) {
+        LOG_INFO("axis: home_on_boot %u -> %u", (unsigned)s_axis.home_on_boot, (unsigned)nv);
+    }
+    s_axis.home_on_boot = nv;
     return true;
 }
 
@@ -2262,6 +2287,25 @@ static void tick_home_sequencer(void)
                     s_last_enctype_read_ms = now;
                 }
             }
+        }
+    }
+
+    /* --- 0x3043 home_on_boot auto-fire --- Once per CMC boot, once we know
+     * the motor uses an incremental encoder (absolute encoders don't need
+     * homing — is_homed is always true), fire a home request. Motor-in-BL
+     * is already gated at the callsite so we don't need to re-check it.
+     * If try_begin rejects (something else running), we retry every tick
+     * until it takes — s_boot_home_fired only latches on a successful
+     * request_home so a transient rejection doesn't burn the one-shot. */
+    static bool s_boot_home_fired = false;
+    if (!s_boot_home_fired
+        && s_axis.home_on_boot
+        && s_encoder_type_known
+        && s_encoder_is_incremental
+        && s_home_seq_state == HOME_SEQ_IDLE) {
+        if (axis_manager_request_home()) {
+            LOG_INFO("axis: home_on_boot=1 -> auto-fired home");
+            s_boot_home_fired = true;
         }
     }
 

@@ -191,8 +191,16 @@ class GraphWindow(QWidget):
             color = _PALETTE[self._color_idx % len(_PALETTE)]
             self._color_idx += 1
             # width=1 cosmetic pen uses Qt's fast path (wide pens are much slower)
-            self.curves[name] = self.plot.plot(pen=pg.mkPen(color, width=1), name=name)
+            curve = self.plot.plot(pen=pg.mkPen(color, width=1), name=name)
+            self.curves[name] = curve
             self._dirty = True
+            # Paused re-check: the redraw loop is short-circuited while paused
+            # so a newly-added curve would stay empty until resume. Populate it
+            # once here from the buffer so the trace reappears immediately (the
+            # buffer keeps every channel's samples regardless of check state,
+            # so re-check during pause is fully non-destructive).
+            if self.paused:
+                self._populate_curve_from_buffer(name, curve)
         elif not on and name in self.curves:
             self.plot.removeItem(self.curves.pop(name))
             self._dirty = True
@@ -310,6 +318,18 @@ class GraphWindow(QWidget):
             self.marker_label.setText(
                 "Δt = " + ", ".join(f"{d:.4f}" for d in deltas) + f" s   [{len(xs)} markers]"
             )
+
+    def _populate_curve_from_buffer(self, name: str, curve: pg.PlotDataItem) -> None:
+        """One-shot draw of a single curve from the buffer over the current view.
+        Used to repaint a curve added while paused, so the redraw loop's
+        early-return-on-paused doesn't leave the trace blank."""
+        (x_lo, x_hi), _ = self.plot.getViewBox().viewRange()
+        margin = max(1e-9, (x_hi - x_lo) * 0.1)
+        seg = self.buffer.window(name, x_lo - margin, x_hi + margin)
+        if seg is not None and len(seg[0]):
+            curve.setData(seg[0], seg[1], skipFiniteCheck=True)
+        else:
+            curve.setData([], [])
 
     # --- redraw ---------------------------------------------------------------
     def _redraw(self) -> None:

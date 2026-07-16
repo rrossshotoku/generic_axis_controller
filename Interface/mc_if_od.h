@@ -154,6 +154,7 @@ typedef enum
 #define MC_IF_FAULT_NO_CONFIG  (0x00000001u)  /* no valid persistent config loaded -> operational drive inhibited (ADR-051) */
 #define MC_IF_FAULT_NOT_HOMED  (0x00000002u)  /* incremental encoder not yet zeroed -> position recalls blocked; re-home each power-up (ADR-057) */
 #define MC_IF_FAULT_OVERCURRENT (0x00000004u)  /* over-current trip active (the OC trip); latched into fault_flags_latched too (ADR-058) */
+#define MC_IF_FAULT_OVERTEMP   (0x00000008u)  /* thermal model utilisation exceeded the limit and derate couldn't hold it (ADR-065) */
 
 /* ===== Bootloader control (0x1F51:1 program_control) ============================
  * PC tool writes these expedited to walk the target through an update. See
@@ -267,6 +268,14 @@ typedef enum
     X(0x2000, 5, motor_pole_pairs,            MC_IF_T_U16, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     /* Drive backend (per-board, applied at boot, ADR-039): 0 = BLDC/PMSM FOC 3-shunt, 1 = brushed-DC H-bridge. */ \
     X(0x2000, 6, motor_backend_sel,           MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    /* --- 0x2100 motor thermal model (I²t, ADR-065). Two params only: I_cont + tau.       */ \
+    /* The continuous/duty distinction lives in the GUI calculator, which derives these.   */ \
+    X(0x2100, 1, thermal_enable,              MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2100, 2, thermal_i_cont_a,            MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2100, 3, thermal_tau_s,               MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2100, 4, thermal_utilisation,         MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
+    X(0x2100, 5, thermal_derate_factor,       MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
+    X(0x2100, 6, thermal_derate_start,        MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     /* --- 0x2200 position controller --- */ \
     X(0x2200, 1, pos_kp,                      MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2200, 2, pos_ki,                      MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
@@ -310,6 +319,7 @@ typedef enum
     X(0x2410, 4, tlm_vq_v,                    MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2410, 5, tlm_electrical_angle_rad,    MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2410, 6, tlm_i_arm_a,                 MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
+    X(0x2410, 7, tlm_v_arm_v,                 MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     /* --- 0x2500 encoder / state estimator + telemetry --- */ \
     X(0x2500, 1, est_electrical_offset_rad,   MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2500, 2, est_velocity_filter_hz,      MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
@@ -345,10 +355,11 @@ typedef enum
     X(0x2600, 9, traj_use_scurve,             MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     /* Sticky OR of every fault_flags bit set since boot -- fault history (faults triggered previously + cleared). Not persisted. (ADR-058) */ \
     X(0x2600, 10, fault_flags_latched,        MC_IF_T_U32, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
-    /* Per-fault trigger counts (U16, since boot, saturating): how many times each fault_flags bit has RISEN; RAM only. :11 NO_CONFIG, :12 NOT_HOMED, :13 OVERCURRENT. (ADR-058) */ \
+    /* Per-fault trigger counts (U16, since boot, saturating): how many times each fault_flags bit has RISEN; RAM only. :11 NO_CONFIG, :12 NOT_HOMED, :13 OVERCURRENT, :14 OVERTEMP. (ADR-058/065) */ \
     X(0x2600, 11, fault_count_no_config,      MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2600, 12, fault_count_not_homed,      MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2600, 13, fault_count_overcurrent,    MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    X(0x2600, 14, fault_count_overtemp,       MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     /* --- 0x2700 calibration --- */ \
     X(0x2700, 1, cal_command,                 MC_IF_T_U16, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2700, 2, cal_status,                  MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
@@ -487,6 +498,12 @@ typedef enum
     X(0x3040, 0, axis_home_command,           MC_IF_T_U8,  MC_IF_A_WO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     X(0x3041, 0, axis_home_status,            MC_IF_T_U8,  MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
     X(0x3042, 0, axis_is_homed,               MC_IF_T_U8,  MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_CMC) \
+    /* axis_home_on_boot — when set to 1, axis_manager auto-fires a homing */ \
+    /* procedure once per CMC boot as soon as the motor's encoder type is  */ \
+    /* known and reports incremental. Persisted with the other axis_manager*/ \
+    /* tunables (PERSIST_REGION_CONFIG). Operator writes 0/1 via PC tool /  */ \
+    /* web UI, then Save to flash. Only fires if motor is not in bootloader.*/ \
+    X(0x3043, 0, axis_home_on_boot,           MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC) \
     /* --- 0x3070 axis_role — which CAMERAD movement axis this physical CMC \
      * consumes from every MOVEMENT frame. Values mirror CAMERAD_AXIS_* \
      * bitmap: 0x01=PAN, 0x02=TILT, 0x04=ZOOM, 0x08=FOCUS, 0x10=X, 0x20=Y, \

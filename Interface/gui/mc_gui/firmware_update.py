@@ -172,50 +172,69 @@ class FirmwareUpdater:
 
     # --- segmented download -------------------------------------------------
     def _download_init(self, total_bytes: int) -> None:
-        seq = self._next_seq()
-        req = proto.build_download_init(seq, OD_PROG_DATA_INDEX, OD_PROG_DATA_SUB, total_bytes)
-        # Erase can take multiple seconds — bump the per-attempt timeout well
-        # above the CMC's cia402 raw passthrough timeout for DOWNLOAD_INIT
-        # (currently 10 s). If we're timing out at 10 s but the motor is
-        # still erasing, we'd give up early.
-        resp = self._send_recv(req, seq, timeout=15.0, retries=1)
-        if resp is None:
-            raise UpdateError("DOWNLOAD_INIT — no response (motor bootloader may be erasing; retry after ~10 s)")
-        hdr, payload = resp
-        # CMC forwards a MSG_OD_DOWNLOAD_RESP if motor answered normally; if
-        # cia402 timed out or the motor sent an error, CMC surfaces it as
-        # MSG_ERROR with class ERR_OD and detail = MC_IfOdResult_t.
-        if hdr.type == proto.MSG_ERROR:
-            e = proto.parse_error(payload)
-            det = f"class=0x{e.error_class:02X} detail=0x{e.detail:02X}" if e else "unparseable"
-            raise UpdateError(f"DOWNLOAD_INIT — CMC returned ERROR ({det})")
-        if hdr.type != proto.MSG_OD_DOWNLOAD_RESP:
-            raise UpdateError(f"DOWNLOAD_INIT — unexpected msg_type=0x{hdr.type:02X}")
-        r = proto.parse_download_resp(payload)
-        if r is None:
-            raise UpdateError(f"DOWNLOAD_INIT — malformed DOWNLOAD_RESP ({len(payload)} B)")
-        if r.result != proto.OD_OK:
-            raise UpdateError(f"DOWNLOAD_INIT rejected (result=0x{r.result:02X})")
+        # INIT triggers a multi-second app-region erase — longer than the CMC's
+        # cia402 raw-passthrough deadline — so the first INIT frequently comes
+        # back NOT_READY / INTERNAL-queue-full (transient backpressure) while the
+        # motor is still erasing. Retry until the erase finishes and the motor
+        # acks OK, then the segments follow. Bounded so a hard error still surfaces.
+        deadline = time.monotonic() + 45.0
+        while True:
+            seq = self._next_seq()
+            req = proto.build_download_init(seq, OD_PROG_DATA_INDEX, OD_PROG_DATA_SUB, total_bytes)
+            # Per-attempt timeout above the CMC's ~10 s passthrough deadline so a
+            # slow erase isn't cut off mid-attempt.
+            resp = self._send_recv(req, seq, timeout=15.0, retries=1)
+            if resp is None:
+                raise UpdateError("DOWNLOAD_INIT — no response (motor bootloader may be erasing; retry after ~10 s)")
+            hdr, payload = resp
+            # CMC forwards a MSG_OD_DOWNLOAD_RESP if the motor answered normally;
+            # if cia402 timed out or the motor sent an error, CMC surfaces it as
+            # MSG_ERROR with class ERR_OD and detail = MC_IfOdResult_t.
+            if hdr.type == proto.MSG_ERROR:
+                e = proto.parse_error(payload)
+                if proto.is_transient_error(e) and time.monotonic() < deadline:
+                    time.sleep(0.2)      # still erasing / momentarily busy — resend INIT
+                    continue
+                det = f"class=0x{e.error_class:02X} detail=0x{e.detail:02X}" if e else "unparseable"
+                raise UpdateError(f"DOWNLOAD_INIT — CMC returned ERROR ({det})")
+            if hdr.type != proto.MSG_OD_DOWNLOAD_RESP:
+                raise UpdateError(f"DOWNLOAD_INIT — unexpected msg_type=0x{hdr.type:02X}")
+            r = proto.parse_download_resp(payload)
+            if r is None:
+                raise UpdateError(f"DOWNLOAD_INIT — malformed DOWNLOAD_RESP ({len(payload)} B)")
+            if r.result != proto.OD_OK:
+                raise UpdateError(f"DOWNLOAD_INIT rejected (result=0x{r.result:02X})")
+            return
 
     def _download_segment(self, chunk: bytes, toggle: int, last: bool) -> proto.DownloadResp:
-        seq = self._next_seq()
-        req = proto.build_download_segment(seq, chunk, toggle, last)
-        resp = self._send_recv(req, seq, timeout=0.5, retries=4)
-        if resp is None:
-            raise UpdateError("DOWNLOAD_SEGMENT — no response")
-        hdr, payload = resp
-        if hdr.type == proto.MSG_ERROR:
-            e = proto.parse_error(payload)
-            det = f"class=0x{e.error_class:02X} detail=0x{e.detail:02X}" if e else "unparseable"
-            raise UpdateError(f"DOWNLOAD_SEGMENT — CMC returned ERROR ({det})")
-        if hdr.type != proto.MSG_OD_DOWNLOAD_RESP:
-            raise UpdateError(f"DOWNLOAD_SEGMENT — unexpected msg_type=0x{hdr.type:02X}")
-        r = proto.parse_download_resp(payload)
-        if r is None:
-            raise UpdateError(f"DOWNLOAD_SEGMENT — malformed DOWNLOAD_RESP ({len(payload)} B)")
-        if r.result != proto.OD_OK:
-            raise UpdateError(f"DOWNLOAD_SEGMENT rejected (result=0x{r.result:02X})")
-        return r
+        # Resend the same segment (idempotent by toggle) while the CMC's single
+        # in-flight OD slot is momentarily full (INTERNAL/queue-full, class 0x09)
+        # or the motor is not-ready — server backpressure, not a real failure.
+        # _send_recv only re-sends on timeout, so the transient ERROR frame must
+        # be retried here. Bounded so a genuine hard error still surfaces.
+        for _attempt in range(20):
+            seq = self._next_seq()
+            req = proto.build_download_segment(seq, chunk, toggle, last)
+            resp = self._send_recv(req, seq, timeout=0.5, retries=4)
+            if resp is None:
+                raise UpdateError("DOWNLOAD_SEGMENT — no response")
+            hdr, payload = resp
+            if hdr.type == proto.MSG_ERROR:
+                e = proto.parse_error(payload)
+                if proto.is_transient_error(e):
+                    time.sleep(0.02)
+                    continue
+                det = f"class=0x{e.error_class:02X} detail=0x{e.detail:02X}" if e else "unparseable"
+                raise UpdateError(f"DOWNLOAD_SEGMENT — CMC returned ERROR ({det})")
+            if hdr.type != proto.MSG_OD_DOWNLOAD_RESP:
+                raise UpdateError(f"DOWNLOAD_SEGMENT — unexpected msg_type=0x{hdr.type:02X}")
+            r = proto.parse_download_resp(payload)
+            if r is None:
+                raise UpdateError(f"DOWNLOAD_SEGMENT — malformed DOWNLOAD_RESP ({len(payload)} B)")
+            if r.result != proto.OD_OK:
+                raise UpdateError(f"DOWNLOAD_SEGMENT rejected (result=0x{r.result:02X})")
+            return r
+        raise UpdateError("DOWNLOAD_SEGMENT — CMC slot busy (INTERNAL/queue-full) after 20 retries")
 
     # --- CMC come-up wait ---------------------------------------------------
     def _wait_for_bootloader(self, deadline_s: float) -> None:
@@ -331,6 +350,12 @@ class FirmwareUpdater:
             self._wait_for_bootloader(15.0)
 
             # --- Step 5: segmented download. -------------------------------
+            # Defensive: clear any stale/partial session left by a previously
+            # aborted attempt. A fresh INIT on an already-active session is
+            # idempotent (no re-erase / cursor reset), so without this a retry
+            # after a mid-download failure would misalign. On a clean session
+            # this is a harmless no-op.
+            self._write_u8(OD_PROG_CONTROL_INDEX, OD_PROG_CONTROL_SUB, PROG_ABORT)
             self._cb(Progress(stage="erasing", total_bytes=total,
                               message="Erasing app region + starting download…"))
             self._download_init(total)
@@ -359,13 +384,20 @@ class FirmwareUpdater:
             # --- Step 6: verify. -------------------------------------------
             self._cb(Progress(stage="verifying", message="Verifying image…"))
             self._write_u8(OD_PROG_CONTROL_INDEX, OD_PROG_CONTROL_SUB, PROG_VERIFY)
-            # Cross-check: read 0x1F56 which SHOULD now compute CRC over the
-            # newly written bytes, and compare locally to what we expected.
-            # Some bootloader implementations return 0 (not implemented) —
-            # in that case we skip the local compare and trust PROG_VERIFY's
-            # on-chip result. Segmented-SDO's toggle bit + last-segment
-            # semantics already catch most transport errors.
-            got_crc = self._read_u32(OD_PROG_SOFTWARE_ID_INDEX, OD_PROG_SOFTWARE_ID_SUB)
+            # Cross-check: read 0x1F56 (CRC over the newly written bytes) and
+            # compare locally to what we expected. The bootloader computes this
+            # asynchronously (its main loop, not the OD/ISR path) after
+            # PROG_VERIFY, so 0x1F56 reads 0 for a few ms — poll briefly so we get
+            # the real value and actually run the compare instead of racing it.
+            # A genuine 0 after the poll (CRC not implemented) falls back to
+            # trusting PROG_VERIFY + the segmented-SDO toggle/last-segment checks.
+            got_crc = 0
+            _verify_deadline = time.monotonic() + 2.0
+            while time.monotonic() < _verify_deadline:
+                got_crc = self._read_u32(OD_PROG_SOFTWARE_ID_INDEX, OD_PROG_SOFTWARE_ID_SUB)
+                if got_crc != 0:
+                    break
+                time.sleep(0.1)
             if got_crc == 0:
                 self._cb(Progress(stage="verifying",
                                   message=f"WARN: 0x1F56 returned 0 (bootloader CRC not implemented?) — "

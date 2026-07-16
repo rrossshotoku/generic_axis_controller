@@ -19,12 +19,12 @@
  * enough that the operator can see "yes, it powered up". */
 #define BOOT_SOLID_MS         3000u
 
-/* Breathing — perceptually-exponential ramp up + down, repeating. 500 ms
- * up + 500 ms down = 1 s full cycle (doubled from the previous 2 s cycle).
- * Brightness is computed each tick as a fraction of the cycle position
- * then squared for the natural "breathing" feel — see breath_brightness. */
-#define BREATH_UP_MS          500u
-#define BREATH_DOWN_MS        500u
+/* Breathing — perceptually-exponential ramp up + down, repeating. 1000 ms
+ * up + 1000 ms down = 2 s full cycle. Brightness is computed each tick as
+ * a fraction of the cycle position then squared for the natural "breathing"
+ * feel — see breath_brightness. */
+#define BREATH_UP_MS          1000u
+#define BREATH_DOWN_MS        1000u
 #define BREATH_CYCLE_MS       (BREATH_UP_MS + BREATH_DOWN_MS)
 
 /* Network link-up flash: three blinks. ON_MS bright + OFF_MS dark per

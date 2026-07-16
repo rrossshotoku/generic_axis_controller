@@ -19,9 +19,18 @@
 #include "boot_flag.h"
 #include "boot_od.h"
 
+#include "bsp/time/time.h"
+#include "main.h"                   /* DEBUG_LED_Pin / DEBUG_LED_GPIO_Port */
 #include "stm32g4xx_hal.h"
 
 #include <stdint.h>
+
+/* Bootloader heartbeat = 500 ms toggle (1 Hz full on/off cycle). Twice the
+ * rate of the app's 1000 ms toggle in app/main_loop (0.5 Hz cycle) so the
+ * operator can tell at a glance which image is running: fast blink = in
+ * bootloader, slow blink = app. Uses the same DEBUG_LED (PB11) which
+ * MX_GPIO_Init already configures as output for us. */
+#define BOOT_HEARTBEAT_PERIOD_MS  500u
 
 /* Cube-generated peripheral initialisers we reuse from the app tree. */
 extern void SystemClock_Config(void);
@@ -116,8 +125,13 @@ int main(void)
     MX_SPI2_Init();
     boot_od_init();
 
+    uint32_t last_beat = time_ms();
     while (1) {
         boot_od_tick();
+        if (time_elapsed_ms(last_beat) >= BOOT_HEARTBEAT_PERIOD_MS) {
+            last_beat += BOOT_HEARTBEAT_PERIOD_MS;
+            HAL_GPIO_TogglePin(DEBUG_LED_GPIO_Port, DEBUG_LED_Pin);
+        }
         HAL_Delay(1);
     }
 }

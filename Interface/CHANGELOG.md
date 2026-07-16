@@ -23,6 +23,51 @@ This is the **authoritative change history** for the shared inter-MCU boundary c
 
 ---
 
+## [5.5.0] - 2026-07-15  (wire-breaking? no — additive motor-owned telemetry)
+
+### Added
+- **`0x2410:7 tlm_v_arm_v`** (F32 RO, PDO-mappable, motor-owned): brushed-DC **armature voltage command** (`v_cmd` — the current-PI output driving the locked-antiphase H-bridge) — the DC-drive analog of `0x2410:4 tlm_vq_v`. Lets an operator watch/graph the applied armature voltage, e.g. to distinguish a voltage/back-EMF speed ceiling (where `v_cmd` saturates at its clamp) from a software velocity clamp. Was previously only the SWD debug-watch var `g_mc_debug.v_cmd_v`. ADR-039.
+
+### Consumers to update
+- motor-control MCU: implemented (mirrored from `g_mc_debug.v_cmd_v` in `od_mirror_live`). Rebuild + reflash.
+- network MCU: none — motor-owned.
+- PC tool: re-parse `mc_if_od.h`; add `tlm_v_arm_v` to the `0x2A00` telemetry map to graph it.
+
+No `MC_IF_PROTOCOL_VERSION` bump — additive, motor-owned.
+
+## [5.4.0] - 2026-07-09  (wire-breaking? no — additive motor-owned OD block, non-PDO)
+
+### Added
+- **`0x2100` motor thermal model** (motor-owned, ADR-065): a winding I²t thermal model with progressive current-limit derate. Two config params only — the continuous/duty distinction lives in the PC-tool calculator, which derives these:
+  - `:1 thermal_enable` (U8 RW PERSIST) — 0 = off (default), 1 = run the model.
+  - `:2 thermal_i_cont_a` (F32 RW PERSIST) — continuous current rating / steady-state limit [A].
+  - `:3 thermal_tau_s` (F32 RW PERSIST) — thermal time constant [s]; 0 = no burst tolerance (plain limit at I_cont).
+  - `:4 thermal_utilisation` (F32 RO, **PDO-mappable**) — live utilisation x (0 = cold, 1 = at limit); add to the `0x2A00` telemetry map to graph it climbing.
+  - `:5 thermal_derate_factor` (F32 RO, **PDO-mappable**) — live current-limit multiplier (1 = none, 0 = fully derated); telemetry-mappable.
+  - `:6 thermal_derate_start` (F32 RW PERSIST) — utilisation x (0..1) at which the derate begins (default 0.85, clamped [0, 0.99]); derate is full at x=1.
+- **`MC_IF_FAULT_OVERTEMP = 0x8`** in `fault_flags` (0x2600:1) + count at **`0x2600:14 fault_count_overtemp`** (U16 RO) — the thermal backstop fault (derate couldn't hold the limit, e.g. a stall pinning current). ADR-065.
+
+### Consumers to update
+- motor-control MCU: implemented (`mc_thermal`; 0x2100 served, OVERTEMP raised, operational current limit derated in `od_apply_gains`; the hard OC trip is not derated). Rebuild + reflash.
+- network MCU: none required — motor-owned, non-PDO. Optionally surface `0x2100:1/2/3` as proxied writes + `:4/:5` and the OVERTEMP fault bit in the operator UI (like the accel-ramp params).
+- PC tool: re-parse `mc_if_od.h` (the new entries appear automatically); adds a **thermal calculator** (Tools tab) that derives `I_cont`/`tau` from a continuous or duty spec and writes `0x2100:1/2/3`.
+
+No `MC_IF_PROTOCOL_VERSION` bump — additive, motor-owned, non-PDO (matches the `0x2300:10 jog_position_mode` precedent).
+
+## [5.3.0] - 2026-07-09  (wire-breaking? no — additive CMC-owned OD entry)
+
+### Added
+- **`0x3043 axis_home_on_boot`** (U8 RW persist, CMC-owned): when set to 1, the CMC's `axis_manager` fires a homing command once per boot as soon as the motor's encoder type is known and reports incremental. Absolute encoders never auto-home (they don't need to). Persisted in the axis_manager tunables blob alongside the joystick calibration + motion limits — write, then `0x3050 cmc_save_config` to commit. Only fires while the motor is running the app (not the motor bootloader).
+
+### Consumers to update
+- **motor-control MCU**: none — CMC-owned, uses the existing `0x3040/0x3041/0x3042` home protocol against the motor's `0x2700/0x2600` entries.
+- **network MCU** (this project): implemented alongside this entry.
+- **PC tool**: optional GUI toggle in the axis settings pane; the OD entry is already reachable via the generic per-slot editor.
+
+Note: CMC's on-disk `axis_persist_blob_t` version bumped 5 → 6 (added one byte). Boards flashed with a v5 blob will be rejected on load → axis_manager falls back to defaults (`home_on_boot = 0`, no behaviour change). Operator re-Saves via `0x3050` to migrate.
+
+---
+
 ## [5.2.0] - 2026-07-08  (wire-breaking? no — additive CMC-owned OD entries)
 
 ### Added

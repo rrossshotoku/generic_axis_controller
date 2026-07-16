@@ -93,17 +93,17 @@ _MCFG_READOUT_KEYS = [(0x2000, 6), (0x2410, 6), (0x2400, 6), (0x2400, 7), (0x300
 # Motor Command tab on-demand readouts (the accel-ramp "Read" button), routed to _cmd_on_state_read.
 _CMD_READOUT_KEYS = [(0x2300, 6), (0x2300, 7), (0x2300, 8)]   # accel ramp up / dn / jerk
 # Diagnostics group live readouts (faults + state, motor + CMC), routed to _cmd_on_state_read. (ADR-058)
-_DIAG_KEYS = [(0x2600, 1), (0x2600, 10), (0x2600, 11), (0x2600, 12), (0x2600, 13),
+_DIAG_KEYS = [(0x2600, 1), (0x2600, 11), (0x2600, 12), (0x2600, 13), (0x2600, 14),
               (0x6041, 0), (0x3000, 0), (0x3004, 0), (0x3005, 0), (0x3006, 0), (0x3014, 0)]
 _ACTIVE_OP_NAME = {0: "NONE", 1: "HOMING", 2: "SHOT_RECALL", 3: "JOYSTICK"}   # MC_IF_OP_* (mc_if_od.h)
-_FAULT_COUNT_SUBS = {11: "NO_CONFIG", 12: "NOT_HOMED", 13: "OVERCURRENT"}   # 0x2600:sub -> fault name (ADR-058)
-_MOTOR_FAULT_BITS = [(0x1, "NO_CONFIG"), (0x2, "NOT_HOMED"), (0x4, "OVERCURRENT")]
+_FAULT_COUNT_SUBS = {11: "NO_CONFIG", 12: "NOT_HOMED", 13: "OVERCURRENT", 14: "OVERTEMP"}   # 0x2600:sub -> fault name (ADR-058/065)
+_MOTOR_FAULT_BITS = [(0x1, "NO_CONFIG"), (0x2, "NOT_HOMED"), (0x4, "OVERCURRENT"), (0x8, "OVERTEMP")]
 
 def _decode_motor_faults(v: int) -> str:
     if v == 0:
         return "none"
     names = [name for bit, name in _MOTOR_FAULT_BITS if v & bit]
-    extra = v & ~0x7
+    extra = v & ~0xF
     if extra:
         names.append(f"0x{extra:X}")
     return " | ".join(names)
@@ -1024,9 +1024,7 @@ class MainWindow(QMainWindow):
                 self.home_poll_timer.stop()
         elif key == (0x2600, 1):   # motor active faults (ADR-058)
             self.diag_m_fault.setText(_decode_motor_faults(int(res["raw"])))
-        elif key == (0x2600, 10):  # motor fault history (sticky since boot)
-            self.diag_m_hist.setText(_decode_motor_faults(int(res["raw"])))
-        elif key in ((0x2600, 11), (0x2600, 12), (0x2600, 13)):  # per-fault since-boot counts (ADR-058)
+        elif key in ((0x2600, 11), (0x2600, 12), (0x2600, 13), (0x2600, 14)):  # per-fault since-boot counts (ADR-058/065)
             self._diag_fc[key[1]] = int(res["raw"]); self._diag_update_counts()
         elif key == (0x3004, 0):   # CMC error code (ADR-058)
             self._diag_ec = int(res["raw"]); self._diag_update_cmc_err()
@@ -1691,13 +1689,12 @@ class MainWindow(QMainWindow):
             self.client.read_async(entry)
 
     def _build_cmd_diag(self) -> None:
-        """Diagnostics group: motor + CMC active faults, motor fault history (since boot), operating
+        """Diagnostics group: motor + CMC active faults, per-fault counts (since boot), operating
         state. Polled at 1 Hz; reads routed via _cmd_on_state_read. (ADR-058)"""
         self.cmd_diag = QGroupBox("Diagnostics  (faults & state)")
         dgl = QFormLayout(self.cmd_diag)
         self.diag_m_state = QLabel("—"); self.diag_m_state.setStyleSheet("font-weight:bold;")
         self.diag_m_fault = QLabel("—")
-        self.diag_m_hist  = QLabel("—"); self.diag_m_hist.setStyleSheet("color:#a60;")
         self.diag_m_counts = QLabel("—"); self.diag_m_counts.setStyleSheet("font-family: monospace;")
         self.diag_c_state = QLabel("—"); self.diag_c_state.setStyleSheet("font-weight:bold;")
         self.diag_c_err   = QLabel("—")
@@ -1709,7 +1706,6 @@ class MainWindow(QMainWindow):
                                   "STOP is issued. Same-family requests pass through as retarget.")
         dgl.addRow("Motor state:", self.diag_m_state)
         dgl.addRow("Motor active faults:", self.diag_m_fault)
-        dgl.addRow("Motor fault history (since boot):", self.diag_m_hist)
         dgl.addRow("Motor fault counts (since boot):", self.diag_m_counts)
         dgl.addRow("CMC state:", self.diag_c_state)
         dgl.addRow("CMC active operation:", self.diag_c_op)
@@ -1721,7 +1717,7 @@ class MainWindow(QMainWindow):
         d_refresh.clicked.connect(self._diag_poll)
         d_row.addWidget(d_refresh)
         d_clr = QPushButton("Clear faults")
-        d_clr.setToolTip("Clear latched faults (CMC axis_clear_fault). The since-boot history + counts are unaffected.")
+        d_clr.setToolTip("Clear latched faults (CMC axis_clear_fault). The since-boot counts are unaffected.")
         d_clr.clicked.connect(self._cmd_clear_fault)
         d_row.addWidget(d_clr)
         d_row.addStretch(1)
@@ -1890,6 +1886,14 @@ class MainWindow(QMainWindow):
             (0x2600, 4), (0x2600, 5),   # motor safety envelope: vel/accel ceiling (ADR-040; 0 = disabled)
             (0x2600, 6), (0x2600, 7),   # soft position limits, home-rel (ADR-040; lo>=hi = disabled)
         ]),
+        ("Thermal model (0x2100)", [
+            (0x2100, 1),   # thermal_enable (U8): 1 = run the I²t model + derate, 0 = off (ADR-065)
+            (0x2100, 2),   # thermal_i_cont_a — continuous current rating / steady-state limit [A]
+            (0x2100, 3),   # thermal_tau_s — thermal time constant [s]; 0 = no burst tolerance
+            (0x2100, 6),   # thermal_derate_start — utilisation x (0..1) where derating begins (default 0.85)
+            # live readouts 0x2100:4 utilisation / :5 derate_factor are RO -> OD browser / Diagnostics.
+            # Use the Tools-tab thermal calculator to derive I_cont + tau from a continuous or duty spec.
+        ]),
         ("Trajectory profile (S-curve, 0x2600:8/9)", [
             (0x2600, 8),   # max_jerk_rad_s3 — fixed jerk for the S-curve planner (ADR-045)
             (0x2600, 9),   # traj_use_scurve — 1 = jerk-limited S-curve, 0 = trapezoidal (default)
@@ -1926,8 +1930,102 @@ class MainWindow(QMainWindow):
         col.addWidget(self._dq_group)      # plant-ID / open-loop pulse (built by Motor Config)
         col.addWidget(self._dac_group)     # debug DAC output selector (built by Motor Config)
         col.addWidget(self._build_inertia_estimator())
+        col.addWidget(self._build_thermal_calc())
         col.addStretch(1)
         return w
+
+    def _build_thermal_calc(self) -> QGroupBox:
+        """Thermal-model calculator (ADR-065): derive I_cont + tau from a continuous rating or a
+        duty spec, then write them to the motor's thermal model (0x2100). The controller stores
+        only (I_cont, tau); this calculator is where the continuous/duty distinction lives."""
+        g = QGroupBox("Thermal model calculator  (I²t  →  I_cont, τ  →  0x2100)")
+        form = QFormLayout(g)
+        self.th_mode = QComboBox()
+        self.th_mode.addItems(["Continuous rating", "Duty cycle (max current for t_on, off for t_off)"])
+        form.addRow("spec type:", self.th_mode)
+        self.th_current = QLineEdit(); self.th_current.setPlaceholderText("A")
+        self.th_current.setToolTip("Continuous: the continuous current rating (I_cont). "
+                                   "Duty: the max / burst current (I_max).")
+        form.addRow("current  (I_cont / I_max):", self.th_current)
+        self.th_ton = QLineEdit(); self.th_ton.setPlaceholderText("s   (duty only)")
+        form.addRow("on-time  t_on:", self.th_ton)
+        self.th_toff = QLineEdit(); self.th_toff.setPlaceholderText("s   (duty only)")
+        form.addRow("off-time  t_off:", self.th_toff)
+        self.th_n = QLineEdit("4")
+        self.th_n.setToolTip("Duty closure: τ = t_off / N  (N≈4 = 'recovers within the off-time'). ADR-065.")
+        form.addRow("recovery N  (duty):", self.th_n)
+        self.th_tau_in = QLineEdit(); self.th_tau_in.setPlaceholderText("s   (continuous; blank = 0 = no burst)")
+        self.th_tau_in.setToolTip("Continuous: thermal time constant if you have one. Blank/0 = a plain "
+                                  "limit at I_cont (no burst tolerance) — safe default.")
+        form.addRow("τ  (continuous input):", self.th_tau_in)
+        row = QHBoxLayout()
+        b_calc = QPushButton("Compute"); b_calc.clicked.connect(self._thermal_compute)
+        row.addWidget(b_calc); row.addStretch(1)
+        form.addRow(row)
+        self.th_out = QLabel("I_cont = —    τ = —")
+        self.th_out.setStyleSheet("font-weight: bold;")
+        form.addRow("result:", self.th_out)
+        row2 = QHBoxLayout()
+        b_write = QPushButton("Write to motor + enable")
+        b_write.setToolTip("Writes I_cont→0x2100:2, τ→0x2100:3, enable→0x2100:1. "
+                           "Then Save to flash (Motor Config) to persist.")
+        b_write.clicked.connect(self._thermal_write)
+        row2.addWidget(b_write); row2.addStretch(1)
+        form.addRow(row2)
+        note = QLabel("Duty: τ = t_off/N and I_cont is solved so the burst peaks exactly at the limit "
+                      "(≈0.6·I_max for 2 min on / 18 off) — permits the full burst and enforces cooldown. "
+                      "Continuous: I_cont as entered; τ only tunes burst tolerance (0 = limit at I_cont). ADR-065.")
+        note.setWordWrap(True); note.setStyleSheet("color: #888;")
+        form.addRow(note)
+        self._thermal_result = None
+        return g
+
+    def _thermal_compute(self) -> None:
+        """Derive (I_cont, τ) from the entered spec (see ADR-065). Continuous → direct; duty →
+        τ = t_off/N, then solve I_cont from the periodic-steady-state 'peak at the limit' condition."""
+        import math
+        try:
+            i = float(self.th_current.text())
+        except ValueError:
+            self.th_out.setText("enter the current [A]"); return
+        if i <= 0:
+            self.th_out.setText("current must be > 0"); return
+        if self.th_mode.currentIndex() == 0:
+            try:
+                tau = float(self.th_tau_in.text()) if self.th_tau_in.text().strip() else 0.0
+            except ValueError:
+                tau = 0.0
+            i_cont = i
+        else:
+            try:
+                t_on = float(self.th_ton.text()); t_off = float(self.th_toff.text()); n = float(self.th_n.text())
+            except ValueError:
+                self.th_out.setText("duty needs t_on, t_off and N"); return
+            if t_on <= 0 or t_off <= 0 or n <= 0:
+                self.th_out.setText("t_on, t_off, N must be > 0"); return
+            tau = t_off / n
+            x_lo = math.exp(-t_off / tau)          # floor at end of off-period (= exp(-N))
+            e_on = math.exp(-t_on / tau)
+            denom = 1.0 - e_on
+            if denom <= 1e-9:
+                self.th_out.setText("t_on too small vs τ"); return
+            a = (1.0 - x_lo * e_on) / denom        # a = (I_max / I_cont)^2
+            if a <= 0.0:
+                self.th_out.setText("no valid solution (check inputs)"); return
+            i_cont = i / math.sqrt(a)
+        self._thermal_result = (i_cont, tau)
+        self.th_out.setText(f"I_cont = {i_cont:.3g} A     τ = {tau:.4g} s  ({tau / 60.0:.2g} min)")
+
+    def _thermal_write(self) -> None:
+        """Write the computed (I_cont, τ) to the motor thermal model + enable it (0x2100:2/3/1)."""
+        if self._thermal_result is None:
+            self._thermal_compute()
+        if self._thermal_result is None:
+            return
+        i_cont, tau = self._thermal_result
+        self._cmd_write((0x2100, 2), i_cont, "thermal_i_cont_a")
+        self._cmd_write((0x2100, 3), tau,    "thermal_tau_s")
+        self._cmd_write((0x2100, 1), 1,      "thermal_enable")
 
     def _build_motorcfg_panel(self) -> QWidget:
         # key -> row-widget dict, for the read/write plumbing (see _cfg_row).
@@ -1964,7 +2062,8 @@ class MainWindow(QMainWindow):
             "State estimator (0x2500)": "loops",
             "Notch filter — current command (0x2930)": "loops",
             "Faults / limits (0x2600)": "limits",
-            "Trajectory profile (S-curve, 0x2600:8/9)": "limits",
+            "Thermal model (0x2100)": "limits",
+            "Trajectory profile (S-curve, 0x2600:8/9)": "loops",
             "Electrical-alignment parameters (0x2700)": "cal",
         }
 
@@ -2060,7 +2159,7 @@ class MainWindow(QMainWindow):
         hgl = QFormLayout(hg)
         self.home_vel = QDoubleSpinBox()
         self.home_vel.setRange(-50.0, 50.0); self.home_vel.setSingleStep(0.5)
-        self.home_vel.setDecimals(2); self.home_vel.setValue(-1.0); self.home_vel.setSuffix(" rad/s")
+        self.home_vel.setDecimals(2); self.home_vel.setValue(-0.3); self.home_vel.setSuffix(" rad/s")
         self.home_vel.setToolTip("Approach velocity toward the end stop; sign = direction (usually negative). "
                                  "The stop is found when movement stays negligible for 1 s (or an OC trip). "
                                  "Keep it slow for a gentle stall.")

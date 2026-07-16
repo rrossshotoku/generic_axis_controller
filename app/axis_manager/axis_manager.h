@@ -131,6 +131,13 @@ uint8_t  axis_manager_get_home_status           (void);        /* 0x3041 — MC_
 bool     axis_manager_is_homed                  (void);        /* 0x3042 — fault_flags & NOT_HOMED == 0 */
 bool     axis_manager_encoder_is_incremental    (void);        /* true iff NOT_HOMED bit ever observed (incremental encoder) */
 
+/* 0x3043 axis_home_on_boot — persisted flag; when 1, axis_manager fires a
+ * home command once per boot as soon as the motor's encoder type is known
+ * and reports incremental. Motor-in-bootloader defers the fire (checked
+ * again when the motor rejoins the app). */
+uint8_t  axis_manager_get_home_on_boot          (void);        /* 0x3043 */
+bool     axis_manager_set_home_on_boot          (uint8_t v);   /* 0x3043 (0/1) */
+
 /* --- 0x3010-0x301F commands (write-triggered) --- */
 bool  axis_manager_request_enable           (bool enable);  /* 0x3010 write 1/0 */
 bool  axis_manager_request_quick_stop       (void);         /* 0x3011 write 1 — hard decel + disable */
