@@ -1,34 +1,47 @@
 /*
  * app/visca_mgr — VISCA transport + session + dispatch.
  *
- * STUB (2026-07-22). Init logs "visca_mgr: stub — no VISCA implementation
- * yet". Tick is a no-op. The module exists so main_loop can dispatch on
- * the active_protocol flag (0x3080) without conditional-compilation.
+ * First-pass implementation (2026-07-22). Supports the small subset the
+ * PC tool needs for bring-up:
  *
- * When implemented, this module owns the network-facing side of VISCA:
- *   - VISCA-over-IP UDP listener (port 52381 by default) OR serial UART
- *     bring-up, depending on the deployment. Decide at implementation time
- *     — the interface here (init + tick) stays the same either way.
- *   - Address-based dispatch (VISCA frames start with `8x` where `x` is the
- *     target camera 1-7 or 8=broadcast).
- *   - Command decode → cmc_state / axis_manager calls (Pan-Tilt Drive,
- *     Memory Set / Recall, Absolute Position, Home, Reset, inquiries).
- *   - ACK / completion / error responses back to the sender.
+ *   Inquiries:
+ *     - CAM_VersionInq      → static vendor/model/rom identifier
+ *     - Pan_tiltPosInq      → current axis_manager position → int16 pan, 0 tilt
+ *     - CAM_ZoomPosInq      → always 0 (no zoom on this CMC)
  *
- * Compiled in on every build so main_loop can pick between CAMERAD and
- * VISCA at boot without conditional compilation. Only one runs — the
- * inactive module's flash cost is ~10-15 KB when fully implemented.
+ *   Commands:
+ *     - Pan_tiltDrive       → cmc_state_handle_movement_scaled (speed 1-24)
+ *     - Pan_tiltStop        → cmc_state_handle_movement_scaled(0)
+ *                              (Stop is Pan_tiltDrive with direction=03)
+ *     - Pan_tiltHome        → axis_manager_request_home
+ *     - Memory Set (store)  → cmc_state_store_shot
+ *     - Memory Recall       → cmc_state_move_to_shot (fade, uses stored time)
  *
- * Layering: same as controller_mgr — L2, depends on:
- *   - app/visca         (codec, once implemented)
- *   - app/cmc_state     (session / shots / status — transport-agnostic)
- *   - app/axis_manager  (joy_profile, joystick_raw, homing)
- *   - app/config        (device address, ports)
- *   - app/log           (diagnostics)
- *   - bsp/net           (sockets)   OR   bsp/uart (serial, TBD)
- *   - bsp/time          (timeouts)
+ * Transport: VISCA over UDP port 52381 (Sony's VISCA-over-IP standard,
+ * 8-byte IP header + VISCA payload). No TCP. No serial. When/if serial
+ * is added, the app/visca codec is reusable — only this transport layer
+ * needs to change.
  *
- * Does NOT include any other app/ module upward (no main_loop, debug).
+ * Session model: STATELESS. Every command gets an immediate ACK +
+ * Completion (no in-flight tracking). Long-running commands (preset
+ * recall, homing) fire and forget from VISCA's perspective; the caller
+ * polls Pan_tiltPosInq to detect arrival. Real Sony cameras track two
+ * concurrent commands via sockets; we skip that until a real need shows
+ * up.
+ *
+ * Ownership: VISCA has no SELECT/DESELECT/GRAB concept. This module does
+ * NOT call cmc_state_handle_select — any VISCA client can command the
+ * CMC as long as VISCA is the active protocol. If two VISCA clients
+ * fight, last-write-wins; add auto-select if that becomes a problem.
+ *
+ * Layering: L2. Depends on:
+ *   - app/visca         (codec)
+ *   - app/cmc_state     (handle_movement_scaled, store_shot, move_to_shot)
+ *   - app/axis_manager  (get_position_actual, request_home)
+ *   - app/config        (VISCA device address, our IP for socket bring-up)
+ *   - app/log
+ *   - bsp/net
+ *   - bsp/time
  */
 #ifndef APP_VISCA_MGR_H
 #define APP_VISCA_MGR_H
@@ -38,11 +51,13 @@ extern "C" {
 #endif
 
 /* Called once from main_loop_init IFF config_get_active_protocol()
- * returns MC_IF_PROTOCOL_VISCA. Currently just logs the stub state. */
+ * returns MC_IF_PROTOCOL_VISCA. Opens the UDP listen socket on port
+ * VISCA_UDP_PORT (52381). Failure logs an error; the module still
+ * ticks (no-op) so the rest of the system keeps working. */
 void visca_mgr_init(void);
 
 /* Called every loop iteration IFF the CMC booted with VISCA active.
- * Currently no-op. */
+ * Drains one inbound packet per tick, dispatches, sends any responses. */
 void visca_mgr_tick(void);
 
 #ifdef __cplusplus
