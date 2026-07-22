@@ -348,12 +348,14 @@ static void build_config_json(void)
      * 24 bytes is enough for any finite F32 (worst case ~16 digits + sign
      * + decimal + NUL). */
     char b_vel[24], b_plo[24], b_phi[24], b_acc[24];
+    char b_pcur[24];
     char b_load[24];
     char b_aup[24], b_adn[24], b_ajk[24];
     const char *s_vel  = fmt_f32(axis_manager_get_velocity_limit(),      b_vel,  sizeof(b_vel));
     const char *s_plo  = fmt_f32(axis_manager_get_position_limit_lo(),   b_plo,  sizeof(b_plo));
     const char *s_phi  = fmt_f32(axis_manager_get_position_limit_hi(),   b_phi,  sizeof(b_phi));
     const char *s_acc  = fmt_f32(axis_manager_get_accel_limit(),         b_acc,  sizeof(b_acc));
+    const char *s_pcur = fmt_f32(axis_manager_get_position_actual(),     b_pcur, sizeof(b_pcur));
     const char *s_load = fmt_f32(axis_manager_get_load_factor(),         b_load, sizeof(b_load));
     const char *s_aup  = fmt_f32(axis_manager_get_vel_accel_up(),        b_aup,  sizeof(b_aup));
     const char *s_adn  = fmt_f32(axis_manager_get_vel_accel_dn(),        b_adn,  sizeof(b_adn));
@@ -374,13 +376,15 @@ static void build_config_json(void)
             "\"tcp_camerad_port\":%u,"
             "\"panel_a_ip\":\"%u.%u.%u.%u\","
             "\"panel_b_port\":%u,"
-            "\"panel_b_ip\":\"%u.%u.%u.%u\""
+            "\"panel_b_ip\":\"%u.%u.%u.%u\","
+            "\"active_protocol\":%u"
           "},"
           "\"limits\":{"
             "\"velocity\":%s,"
             "\"position_lo\":%s,"
             "\"position_hi\":%s,"
-            "\"accel\":%s"
+            "\"accel\":%s,"
+            "\"position_current\":%s"
           "},"
           "\"joystick\":{"
             "\"raw_center\":%ld,"
@@ -413,7 +417,8 @@ static void build_config_json(void)
         net->panel_a_ip[0], net->panel_a_ip[1], net->panel_a_ip[2], net->panel_a_ip[3],
         (unsigned)net->panel_b_port,
         net->panel_b_ip[0], net->panel_b_ip[1], net->panel_b_ip[2], net->panel_b_ip[3],
-        s_vel, s_plo, s_phi, s_acc,
+        (unsigned)net->active_protocol,
+        s_vel, s_plo, s_phi, s_acc, s_pcur,
         (long)axis_manager_get_joystick_raw_center(),
         (long)axis_manager_get_joystick_raw_full_pos(),
         (long)axis_manager_get_joystick_raw_full_neg(),
@@ -491,7 +496,24 @@ static void apply_config_json(const char *json)
         p = find_key(net, "panel_b_ip");
         if (p) (void)parse_ip_quoted(p, cfg.panel_b_ip);
 
+        /* active_protocol (0x3080). Staged into RAM; takes effect on next
+         * reboot after Save. Silently clamped by config_set_active_protocol
+         * to the known enum range — an unknown value is ignored, not an error. */
+        p = find_key(net, "active_protocol");
+        if (p) {
+            uint32_t v;
+            if (parse_u32(p, &v)) {
+                cfg.active_protocol = (uint8_t)v;   /* config_set_network won't validate; that's what set_active_protocol is for */
+            }
+        }
+
         (void)config_set_network(&cfg);
+        /* Enforce the range check separately (config_set_network is a whole-
+         * struct assignment and doesn't validate individual fields). Any
+         * out-of-range value from the JSON gets clamped to CAMERAD here. */
+        if (cfg.active_protocol >= 2u /* MC_IF_PROTOCOL_COUNT */) {
+            (void)config_set_active_protocol(0u /* CAMERAD */);
+        }
     }
 
     /* limits — applied immediately (live). */

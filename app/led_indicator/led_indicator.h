@@ -6,6 +6,10 @@
  * bsp_leds to render (configured_rgb × brightness).
  *
  * Patterns:
+ *   FAULT_RED     Solid full-brightness RED whenever axis_manager reports
+ *                 AXIS_STATE_FAULT (CiA-402 FAULT bit from the cyclic
+ *                 status header). Overrides operator colour + every other
+ *                 pattern for unambiguous "attention needed" signalling.
  *   BOOT_SOLID    Solid ON at full configured colour for a few seconds
  *                 after boot, so the operator sees the unit is alive.
  *   NET_FLASH     3 quick flashes (off-on-off-on-off-on-off) on a network
@@ -16,10 +20,11 @@
  *                 indication finishes and the motor is idle.
  *
  * Priority (high to low):
- *   1. NET_FLASH (one-shot, can interrupt boot or solid)
- *   2. BREATHING (while motor moving)
- *   3. BOOT_SOLID (during the boot indicator window)
- *   4. SOLID
+ *   1. FAULT_RED (while axis state == FAULT)
+ *   2. NET_FLASH (one-shot, can interrupt boot or solid)
+ *   3. BREATHING (while motor moving)
+ *   4. BOOT_SOLID (during the boot indicator window)
+ *   5. SOLID
  *
  * Colour is operator-tunable via OD 0x3060 (R), 0x3061 (G), 0x3062 (B) and
  * persisted in the axis_persist blob (AXIS_PERSIST_VERSION bumped 3 -> 4

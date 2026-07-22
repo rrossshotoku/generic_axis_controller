@@ -1688,6 +1688,14 @@ class MainWindow(QMainWindow):
         if entry is not None and entry.readable:
             self.client.read_async(entry)
 
+    def _recall_status_read(self) -> None:
+        """Read position_recall_status (0x2700:12) -> _mcfg_update_status decodes it to the label. (ADR-067)"""
+        if not self.client.connected:
+            return
+        entry = self.od.by_key.get((0x2700, 12))
+        if entry is not None and entry.readable:
+            self.client.read_async(entry)
+
     def _build_cmd_diag(self) -> None:
         """Diagnostics group: motor + CMC active faults, per-fault counts (since boot), operating
         state. Polled at 1 Hz; reads routed via _cmd_on_state_read. (ADR-058)"""
@@ -1871,6 +1879,7 @@ class MainWindow(QMainWindow):
         ("Current loop gains (0x2400)", [
             (0x2400, 1), (0x2400, 2), (0x2400, 3), (0x2400, 4), (0x2400, 5),
             (0x2400, 6), (0x2400, 7),   # brushed current PI gains, set directly (ADR-049)
+            (0x2400, 8),   # current_demand_limit_a — soft max demanded current below the OC trip; 0 = off (ADR-069)
         ]),
         ("State estimator (0x2500)", [
             # 0x2500:1 est_electrical_offset is a calibration RESULT (set by the align routine), not an
@@ -1880,6 +1889,13 @@ class MainWindow(QMainWindow):
         ]),
         ("Notch filter — current command (0x2930)", [
             (0x2930, 1), (0x2930, 2), (0x2930, 3),   # enable (1/0) / centre Hz / bandwidth Hz (ADR-048)
+        ]),
+        ("Low-speed dither (0x2320)", [
+            (0x2320, 1),   # dither_enable (U8): 1 = inject anti-stiction dither below the threshold speed (ADR-066)
+            (0x2320, 2),   # dither_speed_threshold_rad_s — dither faded out as |velocity| -> this
+            (0x2320, 3),   # dither_amplitude_a — dither current amplitude [A]
+            (0x2320, 4),   # dither_freq_hz — dither frequency [Hz]
+            # live 0x2320:5 dither_output_a is RO PDO -> add it to the telemetry graph to watch the injection.
         ]),
         ("Faults / limits (0x2600)", [
             (0x2600, 2),
@@ -1900,6 +1916,10 @@ class MainWindow(QMainWindow):
         ]),
         ("Electrical-alignment parameters (0x2700)", [
             (0x2700, 3), (0x2700, 4),
+        ]),
+        ("Position recall (0x2700:11)", [
+            (0x2700, 11),  # position_recall_enable (U8): 1 = auto-store position + recall on boot (incremental only, ADR-067)
+            # live 0x2700:12 position_recall_status is RO -> shown as a readout appended below (special-case).
         ]),
     ]
 
@@ -2061,10 +2081,12 @@ class MainWindow(QMainWindow):
             "Current loop gains (0x2400)": "loops",
             "State estimator (0x2500)": "loops",
             "Notch filter — current command (0x2930)": "loops",
+            "Low-speed dither (0x2320)": "loops",
             "Faults / limits (0x2600)": "limits",
             "Thermal model (0x2100)": "limits",
             "Trajectory profile (S-curve, 0x2600:8/9)": "loops",
             "Electrical-alignment parameters (0x2700)": "cal",
+            "Position recall (0x2700:11)": "cal",
         }
 
         # Drive backend selector (0x2000:6) -- per-board; applied at boot, so save + reboot to take effect.
@@ -2236,6 +2258,22 @@ class MainWindow(QMainWindow):
                 bw.setWordWrap(True)
                 grid.addRow("Est. bandwidth:", bw)
                 self._bw_labels[group_title] = bw
+            if group_title == "Position recall (0x2700:11)" and self.od.by_key.get((0x2700, 12)) is not None:
+                # Live status readout (0x2700:12, RO) + a Read button. Incremental axes only;
+                # inert on absolute encoders (they self-locate). (ADR-067)
+                rrow = QHBoxLayout()
+                self.lbl_recall_status = QLabel("-")
+                self.lbl_recall_status.setStyleSheet("font-family: monospace;")
+                self.lbl_recall_status.setToolTip(
+                    "position_recall_status (0x2700:12). 0 off/N-A, 1 recalled-valid (homing "
+                    "skipped), 2 stale → homing required (power lost mid-move), 3 nothing stored yet.")
+                rrow.addWidget(self.lbl_recall_status, 1)
+                rbtn = QPushButton("Read")
+                rbtn.clicked.connect(lambda _checked=False: self._recall_status_read())
+                rrow.addWidget(rbtn, 0)
+                rw = QWidget(); rw.setLayout(rrow)
+                grid.addRow("Status:", rw)
+                self._mcfg_status[(0x2700, 12)] = self.lbl_recall_status
             if group_title == "State estimator (0x2500)":
                 zrow = QHBoxLayout()
                 self.obs_zeta = QDoubleSpinBox()
@@ -2329,6 +2367,30 @@ class MainWindow(QMainWindow):
             self._led_sliders[channel] = s
             self._led_value_labels[channel] = v
 
+        # Brightness master slider. Defined as max(R,G,B)/255*100 — no
+        # separate state, the R/G/B sliders remain the ground truth. Dragging
+        # brightness rescales R/G/B proportionally so the hue is preserved.
+        # Auto-tracks max(R,G,B) when R/G/B are dragged directly, so the
+        # readout always matches what's on the LED. Corner case: when
+        # max(R,G,B) == 0 there's no hue to preserve, so bumping brightness
+        # up fills all three channels equally (white at target brightness).
+        brow = QHBoxLayout()
+        brow.addWidget(QLabel("Brightness:"))
+        self._led_brightness = QSlider(Qt.Orientation.Horizontal)
+        self._led_brightness.setRange(0, 100)
+        self._led_brightness.setValue(0)
+        self._led_brightness.setToolTip(
+            "Master scale — 100% = the brightest channel at 255. Dragging "
+            "here rescales R/G/B proportionally so hue is preserved.")
+        self._led_brightness.valueChanged.connect(self._led_on_brightness_drag)
+        self._led_brightness.sliderReleased.connect(self._led_brightness_apply)
+        brow.addWidget(self._led_brightness, 1)
+        self._led_brightness_label = QLabel("0%")
+        self._led_brightness_label.setMinimumWidth(36)
+        self._led_brightness_label.setStyleSheet("font-family: monospace;")
+        brow.addWidget(self._led_brightness_label, 0)
+        col.addLayout(brow)
+
         # Live preview swatch + Save button row.
         bar = QHBoxLayout()
         self._led_swatch = QLabel("                    ")
@@ -2359,6 +2421,44 @@ class MainWindow(QMainWindow):
         self._led_value_labels["B"].setText(str(b))
         self._led_swatch.setStyleSheet(
             f"background-color: rgb({r},{g},{b}); border: 1px solid #888;")
+        # Sync brightness readout to max(R,G,B). blockSignals so we don't
+        # trigger the brightness handler and cause a rescale feedback loop.
+        pct = int(round(max(r, g, b) / 255.0 * 100.0))
+        if self._led_brightness.value() != pct:
+            self._led_brightness.blockSignals(True)
+            self._led_brightness.setValue(pct)
+            self._led_brightness.blockSignals(False)
+        self._led_brightness_label.setText(f"{pct}%")
+
+    def _led_on_brightness_drag(self, pct: int) -> None:
+        # Rescale R/G/B proportionally so the max component equals
+        # pct/100 * 255. Preserves hue. When the current max is 0 there's
+        # no ratio to preserve — fill all three equally (white) so the
+        # slider still does something visible.
+        self._led_brightness_label.setText(f"{pct}%")
+        r = self._led_sliders["R"].value()
+        g = self._led_sliders["G"].value()
+        b = self._led_sliders["B"].value()
+        target_max = int(round(pct / 100.0 * 255.0))
+        m = max(r, g, b)
+        if m == 0:
+            new = (target_max, target_max, target_max)
+        else:
+            new = tuple(min(255, int(round(c * target_max / m))) for c in (r, g, b))
+        for ch, v in zip(("R", "G", "B"), new):
+            s = self._led_sliders[ch]
+            s.blockSignals(True)
+            s.setValue(v)
+            s.blockSignals(False)
+            self._led_value_labels[ch].setText(str(v))
+        r2, g2, b2 = new
+        self._led_swatch.setStyleSheet(
+            f"background-color: rgb({r2},{g2},{b2}); border: 1px solid #888;")
+
+    def _led_brightness_apply(self) -> None:
+        # Brightness release: all three R/G/B may have changed, push them all.
+        for ch, idx in (("R", 0x3060), ("G", 0x3061), ("B", 0x3062)):
+            self._led_apply(ch, idx)
 
     def _led_apply(self, channel: str, idx: int) -> None:
         v = self._led_sliders[channel].value()
@@ -3141,6 +3241,15 @@ class MainWindow(QMainWindow):
             summary = ("<b>all complete</b>" if not outstanding
                        else "<b>outstanding:</b> " + ", ".join(outstanding))
             label.setText(" &nbsp; ".join(parts) + " &nbsp;—&nbsp; " + summary)
+        elif entry.key == (0x2700, 12):  # position_recall_status (ADR-067)
+            _txt, _col = {
+                0: ("off / N-A (disabled or absolute encoder)", "#444"),
+                1: ("recalled-valid — homing skipped", "#060"),
+                2: ("stale → homing required (power lost mid-move)", "#a00"),
+                3: ("enabled, nothing stored yet — home once", "#b06000"),
+            }.get(raw, (f"0x{raw:02X}", "#444"))
+            label.setText(_txt)
+            label.setStyleSheet(f"font-family: monospace; color: {_col};")
         elif entry.key == (0x2800, 2):  # store_status bitfield (MC_IF_STORE_VALID | _PENDING)
             valid   = bool(raw & 0x0001)
             pending = bool(raw & 0x0002)

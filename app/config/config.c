@@ -9,6 +9,7 @@
 #include "app/log/log.h"
 #include "app/persist/persist.h"
 #include "bsp/identity/identity.h"
+#include "Interface/mc_if_od.h"    /* MC_IF_PROTOCOL_* */
 #include <string.h>
 
 static network_cfg_t  s_network;
@@ -39,7 +40,14 @@ typedef struct __attribute__((packed)) {
     uint8_t  panel_a_ip[4];     /*  4 — expected source IP for panel A; 0.0.0.0 = slot disabled */
     uint32_t panel_b_port;      /*  4 — panel B listen port, advertised as return_port to panel_b_ip; 0 = slot disabled */
     uint8_t  panel_b_ip[4];     /*  4 — expected source IP for panel B; 0.0.0.0 = slot disabled */
-    uint32_t reserved[3];       /* 12 — room for three more u32s without another version bump */
+    /* Repurposed reserved[0] as active_protocol (0x3080). Value is MC_IF_PROTOCOL_*
+     * in the low byte, zero elsewhere. Old v2 blobs written before this field
+     * existed already had reserved[0] = 0 → loads as MC_IF_PROTOCOL_CAMERAD,
+     * which is also the default, so no version bump or migration needed. If
+     * we ever need this to mean something else, THEN bump v3 with a real
+     * migrator. */
+    uint32_t active_protocol;   /*  4 — MC_IF_PROTOCOL_* (was reserved[0]) */
+    uint32_t reserved[2];       /*  8 — room for two more u32s without another version bump */
 } network_persist_blob_t;       /* total: 48 */
 
 _Static_assert(sizeof(network_persist_blob_t) == 48,
@@ -69,6 +77,7 @@ void config_init(void)
     s_network.od_udp_port      = 5000;
     s_network.log_tcp_port     = 30200;
     s_network.cmc_device_no    = 1;
+    s_network.active_protocol  = MC_IF_PROTOCOL_CAMERAD;   /* default until operator changes it via 0x3080 + Save + Reboot */
 
     /* Try to overlay the operator-tunable fields from flash. On any
      * failure (uninitialised region, CRC mismatch, version bump) the
@@ -93,6 +102,16 @@ void config_init(void)
             s_network.panel_b_port = (uint16_t)blob.panel_b_port;
         }
         memcpy(s_network.panel_b_ip, blob.panel_b_ip, 4);
+        /* active_protocol was written into what used to be reserved[0].
+         * Range-clamp on load so a corrupt value can't crash main_loop's
+         * dispatch switch — unknown values fall back to CAMERAD. */
+        if (blob.active_protocol < MC_IF_PROTOCOL_COUNT) {
+            s_network.active_protocol = (uint8_t)blob.active_protocol;
+        } else {
+            LOG_WARN("config: unknown active_protocol=%lu on flash — using CAMERAD",
+                     (unsigned long)blob.active_protocol);
+            s_network.active_protocol = MC_IF_PROTOCOL_CAMERAD;
+        }
         LOG_INFO("config: network loaded from flash (ip=%u.%u.%u.%u dev=%lu)",
                  s_network.ip[0], s_network.ip[1], s_network.ip[2], s_network.ip[3],
                  (unsigned long)s_network.cmc_device_no);
@@ -103,8 +122,11 @@ void config_init(void)
                  s_network.panel_b_ip[0], s_network.panel_b_ip[1],
                  s_network.panel_b_ip[2], s_network.panel_b_ip[3],
                  (unsigned)s_network.panel_b_port);
+        LOG_INFO("config: active_protocol=%u (%s)",
+                 (unsigned)s_network.active_protocol,
+                 (s_network.active_protocol == MC_IF_PROTOCOL_VISCA) ? "VISCA" : "CAMERAD");
     } else {
-        LOG_INFO("config: network using factory defaults");
+        LOG_INFO("config: network using factory defaults (active_protocol=CAMERAD)");
     }
 
     memset(&s_limits, 0, sizeof(s_limits));
@@ -167,6 +189,19 @@ bool config_set_node_id(uint8_t node_id)
     return true;
 }
 
+uint8_t config_get_active_protocol(void) { return s_network.active_protocol; }
+
+bool config_set_active_protocol(uint8_t protocol)
+{
+    if (protocol >= MC_IF_PROTOCOL_COUNT) return false;
+    if (s_network.active_protocol != protocol) {
+        LOG_INFO("config: active_protocol staged %u -> %u (applies on reboot)",
+                 (unsigned)s_network.active_protocol, (unsigned)protocol);
+    }
+    s_network.active_protocol = protocol;
+    return true;
+}
+
 bool config_save_network_to_flash(void)
 {
     network_persist_blob_t blob;
@@ -180,6 +215,7 @@ bool config_save_network_to_flash(void)
     memcpy(blob.panel_a_ip, s_network.panel_a_ip, 4);
     blob.panel_b_port     = (uint32_t)s_network.panel_b_port;
     memcpy(blob.panel_b_ip, s_network.panel_b_ip, 4);
+    blob.active_protocol  = (uint32_t)s_network.active_protocol;
 
     bool ok = persist_save(PERSIST_REGION_NETWORK, &blob, sizeof(blob),
                            NETWORK_PERSIST_VERSION);

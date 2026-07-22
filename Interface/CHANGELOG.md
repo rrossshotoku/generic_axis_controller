@@ -23,6 +23,49 @@ This is the **authoritative change history** for the shared inter-MCU boundary c
 
 ---
 
+## [5.8.0] - 2026-07-22  (wire-breaking? no — additive motor-owned OD entry)
+
+### Added
+- **`0x2400:8` current_demand_limit_a** (motor-owned, ADR-069): a soft ceiling on the demanded current at the current-loop input, settable **below** the hard over-current trip (`0x2600:2`) so the axis saturates at a chosen current instead of tripping. Clamps the torque-producing command (iq for FOC, armature for brushed) to ±this value; applies to every command source (velocity/position/torque, and the tuning sweep). F32 RW PERSIST, **0 = disabled** (default) — no behaviour change until set.
+
+### Consumers to update
+- motor-control MCU: implemented (fast-loop clamp `clamp_i_demand`; value applied via `od_apply_gains`). Rebuild + reflash.
+- network MCU: none — motor-owned.
+- PC tool: re-parse `mc_if_od.h`; the entry appears in Motor Config → Control loops → "Current loop gains". No PDO.
+
+---
+
+## [5.7.0] - 2026-07-21  (wire-breaking? no — additive motor-owned OD entries)
+
+### Added
+- **`0x2700:11-12` persistent position recall** (motor-owned, ADR-067): for a non-back-drivable **incremental** axis, auto-store the position after every completed move and, on boot, adopt it instead of demanding a re-home. Inert on absolute (SSI) encoders (they self-locate). Journalled in a dedicated flash region (no config-store wear, no bootloader change).
+  - `:11 position_recall_enable` (U8 RW PERSIST) — 0 = off (default); 1 = auto-store + recall on boot.
+  - `:12 position_recall_status` (U8 RO) — 0 off/N-A, 1 recalled-valid (homing skipped), 2 stale → homing required (power lost mid-move), 3 enabled but nothing stored yet.
+
+### Consumers to update
+- motor-control MCU: implemented (`mc_pos_recall` journal + `mc_pos_recall_port_stm32g474`; boot recall + slow-loop store/invalidate in `mc_scheduler`). Rebuild + reflash (OTA-safe; journal region survives updates).
+- network MCU: none — motor-owned.
+- PC tool: re-parse `mc_if_od.h`; a "Position recall (0x2700:11)" toggle + status appears in Motor Config → Calibration. No PDO (status is polled).
+
+---
+
+## [5.6.0] - 2026-07-17  (wire-breaking? no — additive motor-owned OD block)
+
+### Added
+- **`0x2320` low-speed anti-stiction dither** (motor-owned, ADR-066): a zero-mean sine current added to the velocity/position current command below a threshold speed, faded out as speed rises (keeps the mechanism out of stiction at low speed; applied after the notch, bounded by the current limit).
+  - `:1 dither_enable` (U8 RW PERSIST) — 0 = off (default).
+  - `:2 dither_speed_threshold_rad_s` (F32 RW PERSIST) — dither active/faded below `|v|` this.
+  - `:3 dither_amplitude_a` (F32 RW PERSIST) — dither current amplitude [A].
+  - `:4 dither_freq_hz` (F32 RW PERSIST) — dither frequency [Hz].
+  - `:5 dither_output_a` (F32 RO **PDO**) — the dither current being injected now (graphable).
+
+### Consumers to update
+- motor-control MCU: implemented (`mc_dither`; injected after the current-command notch in the medium loop). Rebuild + reflash.
+- network MCU: none — motor-owned.
+- PC tool: re-parse `mc_if_od.h`; a "Low-speed dither (0x2320)" group appears in Motor Config → Control loops; add `dither_output_a` to the `0x2A00` telemetry map to graph it.
+
+No `MC_IF_PROTOCOL_VERSION` bump — additive, motor-owned.
+
 ## [5.5.0] - 2026-07-15  (wire-breaking? no — additive motor-owned telemetry)
 
 ### Added
@@ -53,6 +96,20 @@ No `MC_IF_PROTOCOL_VERSION` bump — additive, motor-owned.
 - PC tool: re-parse `mc_if_od.h` (the new entries appear automatically); adds a **thermal calculator** (Tools tab) that derives `I_cont`/`tau` from a continuous or duty spec and writes `0x2100:1/2/3`.
 
 No `MC_IF_PROTOCOL_VERSION` bump — additive, motor-owned, non-PDO (matches the `0x2300:10 jog_position_mode` precedent).
+
+## [5.4.0] - 2026-07-22  (wire-breaking? no — additive CMC-owned OD entry)
+
+### Added
+- **`0x3080 active_protocol`** (U8 RW PERSIST, CMC-owned): selects which network protocol module the CMC runs at boot. `MC_IF_PROTOCOL_CAMERAD` (0, default) → `app/controller_mgr`; `MC_IF_PROTOCOL_VISCA` (1) → `app/visca_mgr`. Applied at reset only — `main_loop` snapshots once at init and runs the matching module's init + tick. Changing the value persists to the NETWORK region alongside IP/netmask but takes effect only on the next reboot. Operator flow: web UI dropdown → Save → Reboot. Both modules compile into every image (~25 KB of always-present dead code for the inactive one, on a 512 KB part — no issue).
+
+### Consumers to update
+- **motor-control MCU**: none — CMC-owned.
+- **network MCU** (this project): implemented alongside this entry.
+- **PC tool**: optional GUI addition; the entry is reachable via the generic per-slot OD editor.
+
+Note: CMC-side persist blob layout for the NETWORK region is unchanged — `active_protocol` uses one of the previously-reserved u32 slots. Boards with an old NETWORK blob load `active_protocol = 0` (CAMERAD, matching default behaviour) — no operator re-Save required.
+
+---
 
 ## [5.3.0] - 2026-07-09  (wire-breaking? no — additive CMC-owned OD entry)
 

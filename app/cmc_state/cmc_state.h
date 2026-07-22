@@ -1,20 +1,23 @@
 /*
  * app/cmc_state — CMC operational state owned by the network protocol layer.
  *
- * Path-A scope: just the SELECT/DESELECT/GRAB ownership state needed to keep
- * a CAMERAD panel happy after discovery. Shot table, joystick profile,
- * status bits, controller registry — all defer until they're actually used.
- *
- * Semantics mirrored from the Reduced CMC (uc_camd_interface/app/cmc_state.c
- * lines 136-178):
+ * Session ownership, camera-status bits, shot table, joystick profile.
+ * Transport-agnostic: any protocol module (camerad's controller_mgr, a
+ * future visca_mgr, the PC tool's OD writer) can drive these primitives.
+ * The SELECT / DESELECT / GRAB naming came from CAMERAD but the semantics
+ * are generic session-ownership arbitration:
  *   SELECT   from controller X: grant if nobody selected OR X already owns
  *                                it; deny if a different controller owns it.
  *   DESELECT from controller X: only succeeds if X is the current owner.
  *   GRAB     from controller X: always succeeds, transfers ownership from
  *                                whoever currently has it.
+ * A transport without an ownership concept (e.g. VISCA) may skip these
+ * calls entirely and still use shot / movement / status APIs.
  *
- * Layering: L3 (state). Depends only on stdint/stdbool. No `bsp/`, no
- * `Interface/`, no other `app/` module. Reusable from any caller.
+ * Layering: L3 (state). Implementation (cmc_state.c) depends on
+ * `app/axis_manager` (motor position + JOYSTICK op), `app/persist` (shot
+ * table save/load), `app/log`, and `bsp/time`. Callers include this header
+ * only — the DAG stays a tree.
  */
 
 #ifndef APP_CMC_STATE_H
@@ -124,26 +127,45 @@ bool cmc_state_save_shots(void);
  * MOVEMENT message has arrived in JOYSTICK_WATCHDOG_MS).               */
 void cmc_state_update_from_motor(void);
 
-/* === Joystick input from a CAMERAD MOVEMENT message =======================
+/* === Joystick / velocity input from a protocol transport =================
  *
- * Called by controller_mgr each time a MOVEMENT body arrives. `pan` is the
- * signed int8 deflection (CAMERAD wire convention, -128..+127 with 0 =
- * centered). For our single-motor CMC we map the panel's pan axis onto
- * the one motor; other axes (tilt, focus, zoom, x, y, height, fader) are
- * ignored.
+ * Two entry points, both transport-agnostic:
  *
- * Side effects:
- *   - writes axis_manager_set_joystick_raw(pan) → triggers the
- *     calibrated normalisation into joystick_value
+ *   cmc_state_handle_movement_scaled(float v) — the primitive. `v` is
+ *   the normalised deflection in [-1.0, +1.0], with 0 = centered. Any
+ *   transport translates its own wire form into this range and calls this
+ *   directly. VISCA-mgr would divide its magnitude byte by its max range
+ *   and choose the sign from the direction byte; a future analog-stick
+ *   input would divide raw counts by full-scale.
+ *
+ *   cmc_state_handle_movement(int8_t deflection) — CAMERAD wrapper. Takes
+ *   the raw signed int8 (-128..+127, 0 = centered) from a CAMERAD MOVEMENT
+ *   body and forwards to _scaled after normalising by 127. Kept as a thin
+ *   wrapper so controller_mgr's dispatch line reads naturally at the
+ *   MOVEMENT decode site.
+ *
+ * Both entry points share the same side effects:
  *   - if op_mode isn't already JOYSTICK, switches it (so the cyclic
  *     SPI command picks up the new velocity demand on the next cycle)
+ *   - writes the deflection through axis_manager → joystick_value
  *   - stamps a last-seen timestamp for the watchdog
+ *   - REJECTED if a HOMING / SHOT_RECALL op is in flight (arbitration
+ *     via axis_manager_try_begin_op) — the call is silently swallowed.
  *
- * If MOVEMENT messages stop arriving for JOYSTICK_WATCHDOG_MS, the
+ * If either entry stops being called for JOYSTICK_WATCHDOG_MS, the
  * watchdog (run from cmc_state_update_from_motor) zeroes the joystick
- * raw value — the motor sees velocity = 0 and stops.
+ * raw value — the motor sees velocity = 0 and stops. Transports that
+ * send explicit "stop" (like VISCA's Pan-Tilt Stop) can just call
+ * handle_movement_scaled(0.0f); the watchdog is defensive, not required.
+ *
+ * Single-motor CMC: whichever transport supplies the deflection, we
+ * apply it to the one motor. axis_role (OD 0x3070) is a CAMERAD-only
+ * concept selecting which MOVEMENT byte to consume; other transports
+ * (VISCA, direct velocity commands) address one axis at a time and
+ * bypass that.
  */
-void cmc_state_handle_movement(int8_t pan);
+void cmc_state_handle_movement_scaled(float deflection);
+void cmc_state_handle_movement       (int8_t deflection);
 
 /* === TODO(joystick-profile) ===============================================
  *

@@ -78,6 +78,35 @@ bool persist_load(persist_region_t region,
                   void *out, size_t out_cap, uint16_t version,
                   size_t *out_size);
 
+/* Version-tolerant load. Accepts any on-flash version <= current_version;
+ * zero-fills `out` (all `out_cap` bytes) first, then memcpys the on-flash
+ * payload into the front. New/appended fields the current build has that
+ * older on-flash blobs lack end up as 0 — the caller is responsible for
+ * sanitising those into their real defaults (e.g. clamping a zero enum to
+ * a valid value in apply_persist_blob).
+ *
+ * Contract: the caller's schema is append-only. Never reorder, resize, or
+ * remove existing fields — those are semantic changes that this function
+ * cannot detect and would silently mis-load. If you need to change layout,
+ * write a per-version migrator instead of using this.
+ *
+ * `out_flash_version`, if non-NULL, receives the on-flash version so the
+ * caller can log "upgraded from vN to vCUR". Compare to `current_version`
+ * to detect the upgrade case.
+ *
+ * Returns:
+ *   true  — header is valid, CRC matches, payload copied (possibly
+ *           smaller than `sizeof(current_blob)` — tail is zeroed).
+ *   false — region is uninitialised, corrupted, on-flash version >
+ *           current_version (downgrade attempt), or payload larger than
+ *           caller's buffer. Caller falls back to defaults.
+ */
+bool persist_load_or_upgrade(persist_region_t region,
+                             void *out, size_t out_cap,
+                             uint16_t current_version,
+                             size_t *out_size,
+                             uint16_t *out_flash_version);
+
 /* Save a region's payload. Erases the region, then programs
  * header + payload. `version` is stored alongside. Returns true on
  * success.

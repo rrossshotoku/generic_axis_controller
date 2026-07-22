@@ -109,51 +109,110 @@ void persist_init(void)
              (unsigned long)s_regions[PERSIST_REGION_SHOTS ].base_addr);
 }
 
-bool persist_load(persist_region_t region,
-                  void *out, size_t out_cap, uint16_t version,
-                  size_t *out_size)
+/* Common header + CRC + size checks. Returns pointer to the region's
+ * on-flash header on success, NULL on any failure (with a LOG_* line
+ * already emitted). `out_cap` is the caller's buffer capacity — anything
+ * larger than that on flash is rejected because we can't copy it. */
+static const persist_header_t *validate_header(persist_region_t region, size_t out_cap)
 {
-    if (region >= PERSIST_REGION_COUNT || out == NULL) return false;
     const region_info_t *r = &s_regions[region];
-
     const persist_header_t *hdr = (const persist_header_t *)r->base_addr;
 
     if (hdr->magic != PERSIST_MAGIC) {
         LOG_INFO("persist: region %u uninitialised (magic=0x%08lX)",
                  (unsigned)region, (unsigned long)hdr->magic);
-        return false;
-    }
-    if (hdr->version != version) {
-        LOG_WARN("persist: region %u version mismatch (on-flash=%u, expected=%u)",
-                 (unsigned)region, (unsigned)hdr->version, (unsigned)version);
-        return false;
+        return NULL;
     }
     if (hdr->payload_size_bytes == 0 || hdr->payload_size_bytes > r->max_payload) {
         LOG_WARN("persist: region %u bad payload size (%lu, max %lu)",
                  (unsigned)region, (unsigned long)hdr->payload_size_bytes,
                  (unsigned long)r->max_payload);
-        return false;
+        return NULL;
     }
     if (hdr->payload_size_bytes > out_cap) {
         LOG_WARN("persist: region %u caller buffer too small (need %lu, got %lu)",
                  (unsigned)region, (unsigned long)hdr->payload_size_bytes,
                  (unsigned long)out_cap);
-        return false;
+        return NULL;
     }
-
     const uint8_t *payload = (const uint8_t *)(r->base_addr + sizeof(persist_header_t));
     uint32_t calc_crc = crc32_calc(payload, hdr->payload_size_bytes);
     if (calc_crc != hdr->crc32) {
         LOG_WARN("persist: region %u CRC mismatch (on-flash=0x%08lX, calc=0x%08lX)",
                  (unsigned)region, (unsigned long)hdr->crc32, (unsigned long)calc_crc);
+        return NULL;
+    }
+    return hdr;
+}
+
+bool persist_load(persist_region_t region,
+                  void *out, size_t out_cap, uint16_t version,
+                  size_t *out_size)
+{
+    if (region >= PERSIST_REGION_COUNT || out == NULL) return false;
+
+    const persist_header_t *hdr = validate_header(region, out_cap);
+    if (!hdr) return false;
+
+    if (hdr->version != version) {
+        LOG_WARN("persist: region %u version mismatch (on-flash=%u, expected=%u)",
+                 (unsigned)region, (unsigned)hdr->version, (unsigned)version);
         return false;
     }
 
+    const uint8_t *payload = (const uint8_t *)(s_regions[region].base_addr + sizeof(persist_header_t));
     memcpy(out, payload, hdr->payload_size_bytes);
     if (out_size) *out_size = hdr->payload_size_bytes;
     LOG_INFO("persist: region %u loaded (%lu B, v%u)",
              (unsigned)region, (unsigned long)hdr->payload_size_bytes,
              (unsigned)version);
+    return true;
+}
+
+bool persist_load_or_upgrade(persist_region_t region,
+                             void *out, size_t out_cap,
+                             uint16_t current_version,
+                             size_t *out_size,
+                             uint16_t *out_flash_version)
+{
+    if (region >= PERSIST_REGION_COUNT || out == NULL) return false;
+
+    const persist_header_t *hdr = validate_header(region, out_cap);
+    if (!hdr) return false;
+
+    if (hdr->version > current_version) {
+        /* On-flash is newer than we know how to interpret. Refusing beats
+         * silently mis-loading fields that changed meaning under us. */
+        LOG_WARN("persist: region %u DOWNGRADE refused (on-flash=v%u > current=v%u) — "
+                 "did you flash an older firmware? Re-Save from this build to overwrite.",
+                 (unsigned)region, (unsigned)hdr->version, (unsigned)current_version);
+        return false;
+    }
+
+    /* Zero-fill the caller's whole buffer first so any tail bytes beyond
+     * the on-flash payload default to 0. This is the mechanism that makes
+     * append-only field bumps non-destructive: the older blob loads into
+     * the front of the struct, everything else stays zero, and caller's
+     * apply-hook sanitises the zeroed fields into their real defaults. */
+    memset(out, 0, out_cap);
+
+    const uint8_t *payload = (const uint8_t *)(s_regions[region].base_addr + sizeof(persist_header_t));
+    memcpy(out, payload, hdr->payload_size_bytes);
+    if (out_size)          *out_size          = hdr->payload_size_bytes;
+    if (out_flash_version) *out_flash_version = hdr->version;
+
+    if (hdr->version < current_version) {
+        LOG_WARN("persist: region %u UPGRADED in-memory from v%u to v%u "
+                 "(%lu B on flash, %lu B struct) — new fields defaulted; "
+                 "Save to make it permanent",
+                 (unsigned)region, (unsigned)hdr->version, (unsigned)current_version,
+                 (unsigned long)hdr->payload_size_bytes,
+                 (unsigned long)out_cap);
+    } else {
+        LOG_INFO("persist: region %u loaded (%lu B, v%u)",
+                 (unsigned)region, (unsigned long)hdr->payload_size_bytes,
+                 (unsigned)current_version);
+    }
     return true;
 }
 

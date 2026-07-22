@@ -221,6 +221,14 @@ typedef enum
 #define MC_IF_AXIS_STATE_RUNNING   (2u)
 #define MC_IF_AXIS_STATE_FAULT     (3u)
 
+/* ===== active_protocol (0x3080) enum values ===== */
+/* Which network protocol module the CMC runs at boot. Applied on next
+ * reset only — main_loop snapshots once at init. See app/main_loop and
+ * app/config for the dispatch/persist code. */
+#define MC_IF_PROTOCOL_CAMERAD     (0u)   /* app/controller_mgr (default) */
+#define MC_IF_PROTOCOL_VISCA       (1u)   /* app/visca_mgr */
+#define MC_IF_PROTOCOL_COUNT       (2u)
+
 /**
  * @brief Canonical OD object list.  X(index, subindex, name, type, access, flags, owner)
  *
@@ -303,6 +311,13 @@ typedef enum
     X(0x2310, 1, tlm_vel_demand_rad_s,        MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2310, 2, tlm_vel_actual_rad_s,        MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2310, 3, tlm_vel_iq_cmd_a,            MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
+    /* --- 0x2320 low-speed anti-stiction dither (ADR-066): zero-mean sine current added to the */ \
+    /* velocity/position current command below a speed threshold, amplitude faded by speed.     */ \
+    X(0x2320, 1, dither_enable,               MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2320, 2, dither_speed_threshold_rad_s,MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2320, 3, dither_amplitude_a,          MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2320, 4, dither_freq_hz,              MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2320, 5, dither_output_a,             MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     /* --- 0x2400 current/FOC gains + telemetry --- */ \
     X(0x2400, 1, foc_id_kp,                   MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2400, 2, foc_id_ki,                   MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
@@ -313,6 +328,10 @@ typedef enum
        the motor DERIVES the gains kp = wc*L, ki = wc*R and reports them read-only at :6/:7. */ \
     X(0x2400, 6, hb_cur_kp,                   MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2400, 7, hb_cur_ki,                   MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    /* current_demand_limit_a: SOFT ceiling on the demanded current at the current-loop input (ADR-069). */ \
+    /* Clamps the torque-producing command (iq FOC / armature brushed) to +/- this, below the hard OC     */ \
+    /* trip (0x2600:2). Applies to every source (velocity/position/torque/sweep). 0 = disabled (default). */ \
+    X(0x2400, 8, current_demand_limit_a,      MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2410, 1, tlm_id_meas_a,               MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2410, 2, tlm_iq_meas_a,               MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2410, 3, tlm_vd_v,                    MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
@@ -379,6 +398,13 @@ typedef enum
     /* desired mech-home position (absolute frame, e.g. midpoint of two captured travel extremes) + fires    */ \
     /* the command. Transient (not persisted). (ADR-022)                                                    */ \
     X(0x2700, 10, mech_zero_set_rad,          MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
+    /* Persistent position recall (ADR-067): for a non-back-drivable INCREMENTAL axis, auto-store the  */ \
+    /* position after every completed move and, on boot, adopt it instead of demanding a re-home.      */ \
+    /* Inert on absolute (SSI) encoders (they self-locate). Journalled in a dedicated flash region.    */ \
+    X(0x2700, 11, position_recall_enable,     MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    /* position_recall_status: 0 off/N-A, 1 recalled-valid (homing skipped), 2 stale->homing required  */ \
+    /* (power lost mid-move), 3 enabled but nothing stored yet.                                         */ \
+    X(0x2700, 12, position_recall_status,     MC_IF_T_U8,  MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     /* --- 0x2800 persistent store --- */ \
     X(0x2800, 1, store_save_command,          MC_IF_T_U16, MC_IF_A_RW, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
     X(0x2800, 2, store_status,                MC_IF_T_U16, MC_IF_A_RO, MC_IF_F_NONE,    MC_IF_OWNER_MOTOR) \
@@ -511,6 +537,17 @@ typedef enum
      * field out of camerad_movement_t. Default 0x01 (PAN) so existing \
      * pan-axis units keep behaving as before. PERSIST in axis_persist_blob. */ \
     X(0x3070, 0, axis_role,                   MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC) \
+    /* --- 0x3080 active_protocol — which network protocol module runs at boot.  */ \
+    /* Values: MC_IF_PROTOCOL_CAMERAD (0) = app/controller_mgr (default);         */ \
+    /*         MC_IF_PROTOCOL_VISCA   (1) = app/visca_mgr.                        */ \
+    /* Applied at boot only — main_loop snapshots the value once at init and      */ \
+    /* runs the matching module's init + tick. Changing the value writes flash    */ \
+    /* (via cmc_save_network to the NETWORK persist region alongside IP/netmask)  */ \
+    /* but takes effect only on the next reboot. Chosen at boot because each      */ \
+    /* protocol module owns its own sockets/UARTs; hot-swap would need per-       */ \
+    /* module deinit paths that don't exist today. Web UI dropdown + Save + Reboot */ \
+    /* is the intended operator flow. */ \
+    X(0x3080, 0, active_protocol,             MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC) \
     /* --- 0x3050-0x305F CMC persistence triggers --- */ \
     /* Write MC_IF_SAVE_MAGIC (0x7376) to commit the corresponding region   */ \
     /* to the CMC's internal flash. Same magic constant used by the motor   */ \

@@ -151,6 +151,14 @@ bool  axis_manager_request_start_move       (void);         /* 0x3013 write 1 â€
  * Used by cmc_state_stop_movement (panel STOP keys). */
 bool  axis_manager_request_halt             (void);
 
+/* Internal (sub-module use): read the raw enable_latch (what the CMC last
+ * commanded, before the motor's own statusword confirms). Distinct from
+ * axis_manager_get_state which reflects the motor's PDS state. Used by
+ * motor_od_proxy's motor-save sequencer to snapshot operator intent so
+ * re-enable after save matches "what operator wanted", not "what motor
+ * was reporting" (a mid-fault save should still restore operator intent). */
+bool  axis_manager_is_enable_latched        (void);
+
 /* --- 0x3020-0x302F mode + per-mode targets --- */
 axis_op_mode_t  axis_manager_get_op_mode             (void);
 bool            axis_manager_set_op_mode             (uint8_t v);    /* 0x3020 */

@@ -469,7 +469,7 @@ bool cmc_state_get_shot(uint32_t shot_no, cmc_shot_t *out)
  * joystick_max_velocity cap (0x3022).
  *---------------------------------------------------------------------------*/
 
-void cmc_state_handle_movement(int8_t pan)
+void cmc_state_handle_movement_scaled(float deflection)
 {
     /* Operation arbitration (via axis_manager). CONTINUED = we're already in
      * JOYSTICK; the trim retargets. STARTED = new joystick session; caller
@@ -479,9 +479,9 @@ void cmc_state_handle_movement(int8_t pan)
      * We deliberately do NOT stamp s_last_movement_ms while rejecting —
      * the watchdog stays passive, which is correct: there's nothing to
      * watchdog because no joystick input is being honoured. Logging is
-     * suppressed to keep the log clean during multi-second fades (panels
-     * send MOVEMENT at ~25 ms intervals — 120 rejection lines per 3 s
-     * would dominate the log). */
+     * suppressed to keep the log clean during multi-second fades (CAMERAD
+     * panels send MOVEMENT at ~25 ms intervals — 120 rejection lines per
+     * 3 s would dominate the log). */
     axis_begin_result_t br = axis_manager_try_begin_op(AXIS_OPERATION_JOYSTICK);
     if (br == AXIS_BEGIN_REJECTED) {
         return;
@@ -501,9 +501,25 @@ void cmc_state_handle_movement(int8_t pan)
         (void)axis_manager_set_op_mode((uint8_t)AXIS_OP_MODE_JOYSTICK);
     }
 
-    /* Single-motor CMC: only the pan axis maps to our one motor. Other
-     * MOVEMENT axes (tilt, focus, zoom, etc.) are ignored. */
-    (void)axis_manager_set_joystick_raw((int32_t)pan);
+    /* Scale normalised deflection into the raw-space the joystick cal
+     * expects. Multiplying by full_pos/full_neg would honour asymmetric
+     * calibrations, but for a normalised input the operator has already
+     * chosen the direction via the sign, so ±127 is the natural centre
+     * of the cal's expected range (matches CAMERAD wire) and produces
+     * consistent behaviour regardless of transport. Clamp defensively —
+     * a transport with a bug could still send >1.0. */
+    if (deflection >  1.0f) deflection =  1.0f;
+    if (deflection < -1.0f) deflection = -1.0f;
+    int32_t raw = (int32_t)(deflection * 127.0f + (deflection >= 0.0f ? 0.5f : -0.5f));
+    (void)axis_manager_set_joystick_raw(raw);
+}
+
+void cmc_state_handle_movement(int8_t deflection)
+{
+    /* CAMERAD wrapper — the wire form is signed int8 (-128..+127). Divide
+     * by 127 to normalise: full-positive = +1.0, full-negative = ~-1.008
+     * (harmless — the scaled entry clamps to [-1.0, +1.0]). */
+    cmc_state_handle_movement_scaled((float)deflection / 127.0f);
 }
 
 void cmc_state_update_from_motor(void)

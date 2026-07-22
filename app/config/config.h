@@ -43,6 +43,11 @@ typedef struct {
                                    * Telemetry sits at od_udp_port + 1 (= 5001 by default). */
     uint16_t log_tcp_port;        /* log socket, default 30200 */
     uint32_t cmc_device_no;       /* this CMC's CAMERAD device number */
+    /* MC_IF_PROTOCOL_* (0x3080). Which network protocol module main_loop
+     * runs — CAMERAD (0, default) or VISCA (1). Applied at boot only.
+     * Snapshot once at init; do not re-read every tick. Persisted with
+     * the rest of network config. */
+    uint8_t  active_protocol;
 } network_cfg_t;
 
 #define MOTOR_AXIS_COUNT 1   /* Phase 0a: one pan axis. Extend later. */
@@ -76,6 +81,12 @@ bool                   config_set_auth_password(const char *new_password);
 
 uint8_t                config_get_node_id(void);
 bool                   config_set_node_id(uint8_t node_id);
+
+/* active_protocol (0x3080). Small wrappers around the network cfg so
+ * cmc_od + web don't have to memcpy the whole struct through set_network.
+ * Range-clamped to MC_IF_PROTOCOL_COUNT-1; setter returns false on invalid. */
+uint8_t                config_get_active_protocol(void);
+bool                   config_set_active_protocol(uint8_t protocol);
 
 /* Persist the operator-tunable subset of the network config (IP, netmask,
  * gateway, cmc_device_no) to flash via app/persist's NETWORK region.

@@ -116,6 +116,20 @@ void led_indicator_tick(void)
     }
     s_link_was_up = link_now;
 
+    /* Motor fault override — highest priority. Solid full-brightness red
+     * masks the operator-chosen colour AND every pattern (link-flash,
+     * breathing, boot-solid). Fault presence is authoritative via the
+     * CiA-402 FAULT bit in the cyclic status header — updated every tick,
+     * no polling. See axis_manager_get_state / AXIS_STATE_FAULT. */
+    if (axis_manager_get_state() == AXIS_STATE_FAULT) {
+        bsp_leds_set_rgb(255u, 0u, 0u);
+        /* Reset the moving-edge tracker so we don't spuriously trigger a
+         * settle-out pulse when the fault clears (axis was moving pre-fault,
+         * then went straight to idle post-clear). */
+        s_prev_moving = false;
+        return;
+    }
+
     /* Resolve which pattern is active this tick (priority order in header). */
     uint8_t brightness;
 

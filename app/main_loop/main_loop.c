@@ -29,10 +29,13 @@
 #include "app/od/od.h"
 #include "app/cmc_state/cmc_state.h"
 #include "app/controller_mgr/controller_mgr.h"
+#include "app/visca_mgr/visca_mgr.h"
 #include "app/led_indicator/led_indicator.h"
 #include "app/persist/persist.h"
 #include "app/web/web.h"
 #include "app/debug/debug.h"
+
+#include "Interface/mc_if_od.h"    /* MC_IF_PROTOCOL_* */
 #include "bsp/buttons/buttons.h"
 #include "bsp/leds/leds.h"
 #include "bsp/time/time.h"
@@ -43,6 +46,13 @@
 
 /* Heartbeat: blink LED + INFO log once per second. */
 #define HEARTBEAT_PERIOD_MS  1000
+
+/* Active protocol snapshot. Set once at init from config; the tick uses
+ * this cached value so an OD write to 0x3080 mid-session doesn't hot-swap
+ * (the operator must Save + Reboot for the change to take effect).
+ * Sockets/UARTs the mgrs own are brought up in their _init and would
+ * conflict if two mgrs ran simultaneously. */
+static uint8_t s_active_protocol;
 
 void main_loop_init(void)
 {
@@ -91,7 +101,22 @@ void main_loop_init(void)
     led_indicator_init();
     od_init();
     cmc_state_init();
-    controller_mgr_init();
+    /* Protocol dispatch. Snapshot the persisted selection ONCE at boot
+     * and init only the module that will actually run. web_init still
+     * runs regardless — the operator uses the web UI to change the
+     * selection and Save + Reboot to apply. */
+    s_active_protocol = config_get_active_protocol();
+    switch (s_active_protocol) {
+    case MC_IF_PROTOCOL_VISCA:
+        LOG_INFO("main_loop: protocol=VISCA (initialising visca_mgr)");
+        visca_mgr_init();
+        break;
+    case MC_IF_PROTOCOL_CAMERAD:
+    default:
+        LOG_INFO("main_loop: protocol=CAMERAD (initialising controller_mgr)");
+        controller_mgr_init();
+        break;
+    }
     web_init();
     debug_init();
     /* (profile module retired from per-tick use; bsp/time owns DWT init.) */
@@ -119,7 +144,13 @@ void main_loop_run(void)
         /* cmc_state refreshes its on_shot / moving flags from the live
          * motor position; cheap and harmless to call every loop. */
         cmc_state_update_from_motor();
-        controller_mgr_tick();
+        /* Only the mgr matching the boot-time protocol snapshot runs.
+         * The other one is compiled in but never ticked. */
+        switch (s_active_protocol) {
+        case MC_IF_PROTOCOL_VISCA:   visca_mgr_tick();      break;
+        case MC_IF_PROTOCOL_CAMERAD:
+        default:                     controller_mgr_tick(); break;
+        }
         web_tick();
         /* led_indicator_tick reads motor moving state from axis_manager and
          * link state from bsp/net, then drives bsp_leds. Cheap (~µs). */

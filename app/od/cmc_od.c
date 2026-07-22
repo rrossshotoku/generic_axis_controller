@@ -14,6 +14,7 @@
 #include "app/axis_manager/axis_manager.h"
 #include "app/boot_meta/boot_meta.h"
 #include "app/cmc_state/cmc_state.h"
+#include "app/config/config.h"
 #include "app/led_indicator/led_indicator.h"
 #include "app/log/log.h"
 
@@ -163,6 +164,7 @@ MC_IfOdResult_t cmc_od_read(uint16_t idx, uint8_t sub,
     case 0x3042: READ_U8(axis_manager_is_homed() ? 1u : 0u);
     case 0x3043: READ_U8(axis_manager_get_home_on_boot());
     case 0x3070: READ_U8(axis_manager_get_axis_role());
+    case 0x3080: READ_U8(config_get_active_protocol());
 
     /* --- 0x3050-0x305F persistence triggers (WO) --- */
     case 0x3050:                /* cmc_save_config */
@@ -426,6 +428,13 @@ static MC_IfOdResult_t cmc_od_write_inner(uint16_t idx, uint8_t sub,
         sz = check_write_size(MC_IF_T_U8, in_len); if (sz != MC_IF_OD_OK) return sz;
         if (in_type != MC_IF_T_U8) return MC_IF_OD_ERR_TYPE;
         WRITE_OK_OR(axis_manager_set_axis_role(get_u8(in_data)));
+
+    /* --- 0x3080 active_protocol — MC_IF_PROTOCOL_* enum. Applied on next
+     * boot (main_loop snapshots once at init). Save + Reboot to take effect. */
+    case 0x3080:
+        sz = check_write_size(MC_IF_T_U8, in_len); if (sz != MC_IF_OD_OK) return sz;
+        if (in_type != MC_IF_T_U8) return MC_IF_OD_ERR_TYPE;
+        WRITE_OK_OR(config_set_active_protocol(get_u8(in_data)));
 
     /* --- 0x3050 cmc_save_config: write MC_IF_SAVE_MAGIC to commit ---
      * Two-side save: CMC's own persist (axis_persist blob — joystick cal,

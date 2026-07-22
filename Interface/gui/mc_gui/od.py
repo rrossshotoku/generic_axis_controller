@@ -79,6 +79,7 @@ _UNIT_BY_NAME = {
     "vel_accel_up": "rad/s^2", "vel_accel_dn": "rad/s^2", "vel_accel_jerk": "rad/s^3",
     "hb_cur_bandwidth": "rad/s",
     "thermal_tau_s": "s",   # thermal_i_cont_a gets "A" from the _a suffix heuristic (ADR-065)
+    "dither_speed_threshold_rad_s": "rad/s",   # _a -> A, _hz -> Hz picked up by the suffix heuristic (ADR-066)
 }
 
 # Entries shown as hex (bitfields / CiA error codes), keyed by (index, sub) — NOT whole
