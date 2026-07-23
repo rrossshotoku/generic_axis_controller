@@ -63,11 +63,52 @@
 #define VISCA_POS_UNITS_PER_RAD  (1000.0f)
 
 /*----------------------------------------------------------------------------
- * VISCA device address (1..7). No config entry yet — hardcoded to 1.
- * A future 0x3081 visca_device_address could expose this to the operator;
- * for now most VISCA controllers default to address 1 so this Just Works.
+ * VISCA device address (1..7). Sourced from config's cmc_device_no (which
+ * is also what CAMERAD advertises as return_device_no) so operators only
+ * have to set one number for "this CMC's identity." VISCA restricts the
+ * address to 1..7; values outside that range get clamped to 1 with a
+ * WARN log so it's obvious in the boot trace.
+ *
+ * Snapshot once at init — changes require Save + Reboot, matching how
+ * the rest of the network config behaves.
  *---------------------------------------------------------------------------*/
-#define VISCA_OUR_ADDRESS   (1u)
+static uint8_t s_our_address = 1u;   /* set in visca_mgr_init from config */
+
+/*----------------------------------------------------------------------------
+ * Axis role mapping
+ *
+ * The CMC's axis_role (OD 0x3070, set on the web page) picks which physical
+ * axis this hardware represents. CAMERAD uses this to select one byte from
+ * an 8-axis MOVEMENT frame; VISCA doesn't pack axes that way, so we use
+ * axis_role to decide which VISCA command byte to consume:
+ *
+ *   PAN   → Pan_tiltDrive uses VV+YY (pan speed + direction, ÷24)
+ *           Pan_tiltPosInq puts motor position in pan nibbles, tilt=0
+ *   TILT  → Pan_tiltDrive uses WW+ZZ (tilt speed + direction, ÷20)
+ *           Pan_tiltPosInq puts motor position in tilt nibbles, pan=0
+ *
+ * Other roles (ZOOM/FOCUS/X/Y/HEIGHT/FADER) don't map onto Pan_tiltDrive.
+ * VISCA's per-axis commands for those (CAM_Zoom, CAM_Focus, direct
+ * position variants) are not yet implemented — until they are, any
+ * Pan_tiltDrive that arrives while axis_role is one of those roles is
+ * rejected with NOT_EXECUTABLE and logged. ZOOM specifically will pick
+ * up CAM_ZoomPosInq once we add it; today CAM_ZoomPosInq is always 0.
+ *
+ * Values mirror CAMERAD_AXIS_* / mc_if_od.h axis_role bitmap. Defined
+ * locally so we don't include the CAMERAD codec header from a VISCA
+ * transport module.
+ *---------------------------------------------------------------------------*/
+#define VISCA_ROLE_PAN     (0x01u)
+#define VISCA_ROLE_TILT    (0x02u)
+#define VISCA_ROLE_ZOOM    (0x04u)
+#define VISCA_ROLE_FOCUS   (0x08u)
+#define VISCA_ROLE_X       (0x10u)
+#define VISCA_ROLE_Y       (0x20u)
+#define VISCA_ROLE_HEIGHT  (0x40u)
+#define VISCA_ROLE_FADER   (0x80u)
+
+/* Snapshot at init; changes require Save + Reboot. */
+static uint8_t s_axis_role = VISCA_ROLE_PAN;
 
 /*----------------------------------------------------------------------------
  * Command socket used in ACK/Completion. Real Sony cameras rotate between
@@ -119,7 +160,7 @@ static void send_ack(const net_addr_t *peer, uint32_t sequence)
 {
     size_t len = visca_build_ack(&s_tx_buf[VISCA_IP_HEADER_SIZE],
                                  VISCA_TX_BUF_SIZE - VISCA_IP_HEADER_SIZE,
-                                 VISCA_OUR_ADDRESS, VISCA_TX_SOCKET);
+                                 s_our_address, VISCA_TX_SOCKET);
     if (len == 0u) return;
     (void)send_visca_reply(peer, VISCA_IP_TYPE_REPLY, sequence, len);
 }
@@ -129,7 +170,7 @@ static void send_completion(const net_addr_t *peer, uint32_t sequence)
 {
     size_t len = visca_build_completion(&s_tx_buf[VISCA_IP_HEADER_SIZE],
                                         VISCA_TX_BUF_SIZE - VISCA_IP_HEADER_SIZE,
-                                        VISCA_OUR_ADDRESS, VISCA_TX_SOCKET);
+                                        s_our_address, VISCA_TX_SOCKET);
     if (len == 0u) return;
     (void)send_visca_reply(peer, VISCA_IP_TYPE_REPLY, sequence, len);
 }
@@ -141,7 +182,7 @@ static void send_error(const net_addr_t *peer, uint32_t sequence,
 {
     size_t len = visca_build_error(&s_tx_buf[VISCA_IP_HEADER_SIZE],
                                    VISCA_TX_BUF_SIZE - VISCA_IP_HEADER_SIZE,
-                                   VISCA_OUR_ADDRESS, socket, err_type);
+                                   s_our_address, socket, err_type);
     if (len == 0u) return;
     (void)send_visca_reply(peer, VISCA_IP_TYPE_REPLY, sequence, len);
 }
@@ -171,7 +212,7 @@ static bool inq_version(const net_addr_t *peer, uint32_t sequence)
                             VISCA_ROM_VERSION, VISCA_SOCKET_COUNT);
     size_t len = visca_build_inquiry_reply(&s_tx_buf[VISCA_IP_HEADER_SIZE],
                                            VISCA_TX_BUF_SIZE - VISCA_IP_HEADER_SIZE,
-                                           VISCA_OUR_ADDRESS, body, sizeof(body));
+                                           s_our_address, body, sizeof(body));
     if (len == 0u) return false;
     return send_visca_reply(peer, VISCA_IP_TYPE_REPLY, sequence, len);
 }
@@ -188,26 +229,41 @@ static int16_t rad_to_visca_pos(float rad)
 static bool inq_pantilt_pos(const net_addr_t *peer, uint32_t sequence)
 {
     /* Pan_tiltPosInq: 8 bytes (4 nibbles pan + 4 nibbles tilt).
-     * Single-axis CMC: report pan from axis_manager, tilt = 0. */
-    int16_t pan  = rad_to_visca_pos(axis_manager_get_position_actual());
+     * Single-axis CMC: motor position lands in the pan OR tilt nibbles
+     * based on axis_role. If the role isn't PAN or TILT, both fields
+     * are zero — a VISCA client asking about pan/tilt when we represent
+     * a zoom / focus / etc. axis gets a truthful "not pointing anywhere". */
+    int16_t motor_pos = rad_to_visca_pos(axis_manager_get_position_actual());
+    int16_t pan  = 0;
     int16_t tilt = 0;
+    if      (s_axis_role == VISCA_ROLE_PAN)  pan  = motor_pos;
+    else if (s_axis_role == VISCA_ROLE_TILT) tilt = motor_pos;
+    /* other roles: both stay 0 */
     uint8_t body[8];
     visca_pack_pantilt_pos_body(body, pan, tilt);
     size_t len = visca_build_inquiry_reply(&s_tx_buf[VISCA_IP_HEADER_SIZE],
                                            VISCA_TX_BUF_SIZE - VISCA_IP_HEADER_SIZE,
-                                           VISCA_OUR_ADDRESS, body, sizeof(body));
+                                           s_our_address, body, sizeof(body));
     if (len == 0u) return false;
     return send_visca_reply(peer, VISCA_IP_TYPE_REPLY, sequence, len);
 }
 
 static bool inq_zoom_pos(const net_addr_t *peer, uint32_t sequence)
 {
-    /* CAM_ZoomPosInq: 4 bytes (4 nibbles zoom). No zoom on this CMC → 0. */
+    /* CAM_ZoomPosInq: 4 bytes (4 nibbles zoom). If axis_role is ZOOM
+     * report motor position; otherwise 0. Note we do NOT accept CAM_Zoom
+     * drive commands yet, so a ZOOM-role client can read back position
+     * but has no way to command motion via VISCA today. Add the drive
+     * commands (CAM_Zoom Standard 0x07, Direct 0x47) when needed. */
+    int16_t zoom = 0;
+    if (s_axis_role == VISCA_ROLE_ZOOM) {
+        zoom = rad_to_visca_pos(axis_manager_get_position_actual());
+    }
     uint8_t body[4];
-    visca_pack_zoom_pos_body(body, 0);
+    visca_pack_zoom_pos_body(body, zoom);
     size_t len = visca_build_inquiry_reply(&s_tx_buf[VISCA_IP_HEADER_SIZE],
                                            VISCA_TX_BUF_SIZE - VISCA_IP_HEADER_SIZE,
-                                           VISCA_OUR_ADDRESS, body, sizeof(body));
+                                           s_our_address, body, sizeof(body));
     if (len == 0u) return false;
     return send_visca_reply(peer, VISCA_IP_TYPE_REPLY, sequence, len);
 }
@@ -222,10 +278,15 @@ static bool inq_zoom_pos(const net_addr_t *peer, uint32_t sequence)
 
 /* Pan_tiltDrive: 81 01 06 01 VV WW YY ZZ FF
  *   VV = pan speed (0x01..0x18 = 1..24)
- *   WW = tilt speed (ignored on single-axis CMC)
+ *   WW = tilt speed (0x01..0x14 = 1..20)
  *   YY = pan direction (0x01=left, 0x02=right, 0x03=stop)
- *   ZZ = tilt direction (ignored)
- * frame->body carries [VV WW YY ZZ] (4 bytes). */
+ *   ZZ = tilt direction (0x01=up, 0x02=down, 0x03=stop)
+ * frame->body carries [VV WW YY ZZ] (4 bytes).
+ *
+ * axis_role picks which byte pair we consume — PAN uses VV/YY, TILT uses
+ * WW/ZZ. Every other role has no Pan_tiltDrive mapping (VISCA has separate
+ * CAM_Zoom/CAM_Focus/etc. commands for those) so we reject with
+ * NOT_EXECUTABLE + log once per boot. */
 static bool cmd_pantilt_drive(const visca_frame_t *frame,
                               const net_addr_t *peer, uint32_t sequence)
 {
@@ -233,23 +294,50 @@ static bool cmd_pantilt_drive(const visca_frame_t *frame,
         send_error(peer, sequence, 0u, VISCA_ERR_SYNTAX);
         return true;
     }
-    uint8_t vv = frame->body[0];       /* pan speed */
-    /* uint8_t ww = frame->body[1]; */ /* tilt speed — unused */
-    uint8_t yy = frame->body[2];       /* pan direction */
-    /* uint8_t zz = frame->body[3]; */ /* tilt direction — unused */
+    uint8_t vv = frame->body[0];   /* pan speed  */
+    uint8_t ww = frame->body[1];   /* tilt speed */
+    uint8_t yy = frame->body[2];   /* pan direction  */
+    uint8_t zz = frame->body[3];   /* tilt direction */
+
+    /* Pick the (speed, direction, max_speed) triple based on axis_role. */
+    uint8_t speed_byte;
+    uint8_t dir_byte;
+    uint8_t max_speed;
+    if (s_axis_role == VISCA_ROLE_PAN) {
+        speed_byte = vv;
+        dir_byte   = yy;
+        max_speed  = 24u;          /* VISCA pan range 0x01..0x18 */
+    } else if (s_axis_role == VISCA_ROLE_TILT) {
+        speed_byte = ww;
+        dir_byte   = zz;
+        max_speed  = 20u;          /* VISCA tilt range 0x01..0x14 */
+    } else {
+        /* Role has no VISCA Pan_tiltDrive mapping. Log once per boot to
+         * make the mismatch visible; subsequent rejections stay silent. */
+        static bool s_logged_role_mismatch = false;
+        if (!s_logged_role_mismatch) {
+            s_logged_role_mismatch = true;
+            LOG_WARN("visca_mgr: Pan_tiltDrive received but axis_role=0x%02X isn't PAN/TILT — rejecting",
+                     (unsigned)s_axis_role);
+        }
+        send_error(peer, sequence, VISCA_TX_SOCKET, VISCA_ERR_NOT_EXECUTABLE);
+        return true;
+    }
 
     /* Direction 0x03 = Stop regardless of speed byte. Any other value:
-     * 0x01 = left = negative deflection; 0x02 = right = positive.
-     * Speed is clamped to 1..24; 0 is invalid, values >24 are treated as 24. */
+     * 0x01 = decrement (left / down) = negative deflection;
+     * 0x02 = increment (right / up)  = positive deflection.
+     * Speed is clamped to 1..max_speed; 0 is invalid, values above the
+     * per-axis maximum are treated as the maximum. */
     float deflection;
-    if (yy == 0x03u) {
+    if (dir_byte == 0x03u) {
         deflection = 0.0f;
     } else {
-        if (vv == 0u) vv = 1u;
-        if (vv > 24u) vv = 24u;
-        float mag = (float)vv / 24.0f;
-        if (yy == 0x01u)      deflection = -mag;   /* left */
-        else if (yy == 0x02u) deflection =  mag;   /* right */
+        if (speed_byte == 0u)         speed_byte = 1u;
+        if (speed_byte > max_speed)   speed_byte = max_speed;
+        float mag = (float)speed_byte / (float)max_speed;
+        if (dir_byte == 0x01u)      deflection = -mag;   /* left / down */
+        else if (dir_byte == 0x02u) deflection =  mag;   /* right / up */
         else {
             /* Unknown direction byte — reject rather than pick a side. */
             send_error(peer, sequence, 0u, VISCA_ERR_SYNTAX);
@@ -337,6 +425,114 @@ static bool cmd_memory(const visca_frame_t *frame,
     return true;
 }
 
+/* Sony vendor-extension block (`81 01 7E 04 xx ...`) — per Sony's
+ * "VISCA Command List v4" (pro.sony/s3/2022/09/03065933/VISCA_Command_List_v4.pdf).
+ *
+ * frame->body carries the extended payload starting from the xx byte:
+ *   body[0]         = extended sub-command
+ *   body[1..N-1]    = sub-command-specific parameters
+ *
+ * Sub-commands we care about (all others fall through to syntax-error):
+ *
+ *   3D pp        Position-preset mode enable (pp=01 on, 00 off).
+ *                Sony cameras restrict recall to PTZF-position-only when
+ *                enabled. This CMC only has position anyway → no-op ACK.
+ *
+ *   1B pp        Separate-settings-per-preset mode enable.
+ *                On real cameras: each preset can carry its own duration
+ *                / speed / mode. On this CMC every slot ALWAYS has its
+ *                own time_to_shot_s → no-op ACK.
+ *
+ *   27 pp mm     Set preset pp to speed-mode (mm=00) or duration-mode (mm=01).
+ *                We use per-slot stored time for every recall regardless →
+ *                no-op ACK. If mm is neither 00 nor 01, syntax-error.
+ *
+ *   67 pp 0q 0q 0q
+ *                Assign duration to preset pp. The three nibble bytes
+ *                pack a 12-bit unsigned value in 0.1 s units (Sony docs
+ *                specify range 0x00A..0x3DE = 1.0..99.0 s). We accept
+ *                the full 12-bit range 0..4095 (= 0..409.5 s) since a
+ *                rig may want longer / shorter moves than a PTZ camera;
+ *                a WARN log flags values outside the Sony window.
+ *                → cmc_state_set_shot_time_tenths(pp+1, tenths).
+ */
+static bool cmd_sony_ext(const visca_frame_t *frame,
+                         const net_addr_t *peer, uint32_t sequence)
+{
+    if (frame->body_len < 1u) {
+        send_error(peer, sequence, 0u, VISCA_ERR_SYNTAX);
+        return true;
+    }
+    uint8_t sub = frame->body[0];
+
+    if (sub == 0x3Du) {
+        /* Position-preset mode. body: [3D pp]. Accept 00/01, ACK, no-op. */
+        if (frame->body_len < 2u) { send_error(peer, sequence, 0u, VISCA_ERR_SYNTAX); return true; }
+        LOG_INFO("visca_mgr: Sony-ext position-preset mode = %u (no-op — CMC always position-only)",
+                 (unsigned)frame->body[1]);
+        send_ack_and_completion(peer, sequence);
+        return true;
+    }
+    if (sub == 0x1Bu) {
+        /* Separate-settings-per-preset. body: [1B pp]. Accept, ACK, no-op. */
+        if (frame->body_len < 2u) { send_error(peer, sequence, 0u, VISCA_ERR_SYNTAX); return true; }
+        LOG_INFO("visca_mgr: Sony-ext per-preset-settings = %u (no-op — CMC always per-slot)",
+                 (unsigned)frame->body[1]);
+        send_ack_and_completion(peer, sequence);
+        return true;
+    }
+    if (sub == 0x27u) {
+        /* Preset speed/duration mode select. body: [27 pp mm].
+         * mm=00 speed mode, mm=01 duration mode. We use per-slot time
+         * always, so both are effectively duration mode → ACK either way. */
+        if (frame->body_len < 3u) { send_error(peer, sequence, 0u, VISCA_ERR_SYNTAX); return true; }
+        uint8_t pp = frame->body[1];
+        uint8_t mm = frame->body[2];
+        if (mm != 0x00u && mm != 0x01u) {
+            send_error(peer, sequence, 0u, VISCA_ERR_SYNTAX);
+            return true;
+        }
+        LOG_INFO("visca_mgr: Sony-ext preset %u mode=%s (no-op — CMC always uses slot time)",
+                 (unsigned)pp, (mm == 0x01u) ? "duration" : "speed");
+        send_ack_and_completion(peer, sequence);
+        return true;
+    }
+    if (sub == 0x67u) {
+        /* Assign duration to preset. body: [67 pp 0q 0q 0q]. */
+        if (frame->body_len < 5u) { send_error(peer, sequence, 0u, VISCA_ERR_SYNTAX); return true; }
+        uint8_t pp = frame->body[1];
+        if (pp >= 100u) {
+            send_error(peer, sequence, VISCA_TX_SOCKET, VISCA_ERR_NOT_EXECUTABLE);
+            return true;
+        }
+        /* Reassemble 12-bit duration from three low-nibble bytes MSN first. */
+        uint16_t tenths = (uint16_t)(((frame->body[2] & 0x0Fu) << 8)
+                                   | ((frame->body[3] & 0x0Fu) << 4)
+                                   |  (frame->body[4] & 0x0Fu));
+        /* Sony spec range: 0x00A..0x3DE (1.0..99.0 s). Values outside
+         * this window are technically out-of-spec — accept them anyway
+         * for rig flexibility but log a WARN so the operator can see it. */
+        if (tenths < 0x00Au || tenths > 0x3DEu) {
+            LOG_WARN("visca_mgr: preset %u duration=%u tenths (%.1fs) outside Sony range 1.0..99.0s — accepting",
+                     (unsigned)pp, (unsigned)tenths, (double)tenths * 0.1);
+        }
+        uint32_t shot_no = (uint32_t)pp + 1u;
+        bool ok = cmc_state_set_shot_time_tenths(shot_no, (uint32_t)tenths);
+        if (!ok) {
+            /* Empty slot or out-of-range shot_no. Sony convention: NOT_EXECUTABLE. */
+            send_error(peer, sequence, VISCA_TX_SOCKET, VISCA_ERR_NOT_EXECUTABLE);
+            return true;
+        }
+        send_ack_and_completion(peer, sequence);
+        return true;
+    }
+
+    /* Unknown Sony-ext sub-command. */
+    LOG_INFO("visca_mgr: unknown Sony-ext sub=0x%02X", (unsigned)sub);
+    send_error(peer, sequence, 0u, VISCA_ERR_SYNTAX);
+    return true;
+}
+
 /*----------------------------------------------------------------------------
  * Dispatch
  *---------------------------------------------------------------------------*/
@@ -378,6 +574,12 @@ static void dispatch_command(const visca_frame_t *frame,
     }
     if (frame->category == 0x04u && frame->command == 0x3Fu) {
         (void)cmd_memory(frame, peer, sequence);
+        return;
+    }
+    /* Sony vendor-extension block (7E 04 xx). Preset-mode + per-preset
+     * duration commands live here. */
+    if (frame->category == 0x7Eu && frame->command == 0x04u) {
+        (void)cmd_sony_ext(frame, peer, sequence);
         return;
     }
     /* Unknown command. */
@@ -445,7 +647,7 @@ static void service_udp_socket(void)
 
     /* Address filter: accept our address AND broadcast (8).
      * Silent drop for anyone else — real Sony cameras behave the same way. */
-    if (frame.destination != VISCA_OUR_ADDRESS && frame.destination != 8u) {
+    if (frame.destination != s_our_address && frame.destination != 8u) {
         return;
     }
 
@@ -471,13 +673,50 @@ void visca_mgr_init(void)
     memset(s_tx_buf, 0, sizeof(s_tx_buf));
     s_send_fail_log_count = 0;
 
+    /* Derive VISCA device address from the shared cmc_device_no config
+     * field (also used by CAMERAD as return_device_no). VISCA is defined
+     * for addresses 1..7 only; clamp anything outside that range to 1
+     * with a WARN so the boot trace makes the discrepancy obvious. */
+    uint32_t configured = config_get_network()->cmc_device_no;
+    if (configured >= 1u && configured <= 7u) {
+        s_our_address = (uint8_t)configured;
+    } else {
+        s_our_address = 1u;
+        LOG_WARN("visca_mgr: cmc_device_no=%lu is outside VISCA range 1..7 — using address 1",
+                 (unsigned long)configured);
+    }
+
+    /* Snapshot axis_role. Only PAN and TILT have a matching VISCA drive
+     * command shape (Pan_tiltDrive with VV+YY vs WW+ZZ). ZOOM currently
+     * only reads back position via CAM_ZoomPosInq; other roles have no
+     * VISCA command implemented yet. Requests that don't match get an
+     * INFO log + NOT_EXECUTABLE reply (see cmd_pantilt_drive). */
+    s_axis_role = axis_manager_get_axis_role();
+    const char *role_name = "?";
+    switch (s_axis_role) {
+    case VISCA_ROLE_PAN:    role_name = "PAN";    break;
+    case VISCA_ROLE_TILT:   role_name = "TILT";   break;
+    case VISCA_ROLE_ZOOM:   role_name = "ZOOM";   break;
+    case VISCA_ROLE_FOCUS:  role_name = "FOCUS";  break;
+    case VISCA_ROLE_X:      role_name = "X";      break;
+    case VISCA_ROLE_Y:      role_name = "Y";      break;
+    case VISCA_ROLE_HEIGHT: role_name = "HEIGHT"; break;
+    case VISCA_ROLE_FADER:  role_name = "FADER";  break;
+    default: break;
+    }
+    if (s_axis_role != VISCA_ROLE_PAN && s_axis_role != VISCA_ROLE_TILT) {
+        LOG_WARN("visca_mgr: axis_role=0x%02X (%s) has no VISCA Pan_tiltDrive mapping — "
+                 "drive commands will be rejected until CAM_Zoom / CAM_Focus / etc. "
+                 "are implemented", (unsigned)s_axis_role, role_name);
+    }
+
     if (!net_open(VISCA_UDP_SOCKET, NET_PROTO_UDP, VISCA_UDP_PORT, false)) {
         LOG_ERROR("visca_mgr: net_open(UDP :%u) failed — VISCA offline",
                   (unsigned)VISCA_UDP_PORT);
         return;
     }
     LOG_INFO("visca_mgr: ready (VISCA-over-IP UDP :%u, addr=%u, vendor=0x%04X model=0x%04X rom=0x%04X)",
-             (unsigned)VISCA_UDP_PORT, (unsigned)VISCA_OUR_ADDRESS,
+             (unsigned)VISCA_UDP_PORT, (unsigned)s_our_address,
              (unsigned)VISCA_VENDOR_ID, (unsigned)VISCA_MODEL_ID,
              (unsigned)VISCA_ROM_VERSION);
 }

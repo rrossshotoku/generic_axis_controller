@@ -222,6 +222,18 @@ typedef struct {
 
     /* Cached from the v4 cyclic status header (REQ-0013/ADR-033). */
     uint16_t         movement_status;
+
+    /* 0x3044 axis_holding_enable — CMC-owned, replaces motor's 0x2300:9.
+     * 1 = transition to HOLD on op release, 0 = transition to OFF. Applied
+     * uniformly across JOYSTICK / SHOT_RECALL / HOMING exits. See
+     * apply_op_release_hold() and tick_active_op. */
+    uint8_t          holding_enable;
+
+    /* 0x3045 axis_hold_dwell_ms — JOYSTICK op-release quiescent hold in ms.
+     * After both joystick_value = 0 AND motor MOVING cleared, wait this
+     * long before firing apply_op_release_hold. Debounces brief flap-back
+     * gestures. Range 0..65535; 0 = instant release. Default 200. */
+    uint16_t         hold_dwell_ms;
 } axis_t;
 
 static axis_t s_axis;
@@ -237,7 +249,8 @@ static axis_t s_axis;
 static axis_operation_t s_active_op                 = AXIS_OPERATION_NONE;
 static uint32_t         s_active_op_started_ms      = 0u;   /* time_ms() of NONE->op transition, for logging */
 static uint32_t         s_joystick_quiescent_since_ms = 0u; /* 0 = not quiescent; else first tick both stopped */
-#define JOYSTICK_QUIESCENT_HOLD_MS  200u
+/* Dwell before releasing the JOYSTICK op moved to s_axis.hold_dwell_ms
+ * (0x3045 axis_hold_dwell_ms, PERSIST). Default 200 ms, operator-tunable. */
 
 /*----------------------------------------------------------------------------
  * Auto-fault-clear state (referenced in the tick)
@@ -391,6 +404,27 @@ void axis_manager_stop_op(void)
     set_active_op(AXIS_OPERATION_NONE);
 }
 
+/* Called on every op-family release (JOYSTICK / SHOT_RECALL / HOMING → NONE).
+ * Applies the CMC-owned holding_enable rule:
+ *   1 → transition op_mode to HOLD  (motor halts + holds at zero velocity)
+ *   0 → transition op_mode to OFF   (drive disabled, back-drivable)
+ * See 0x3044 axis_holding_enable in Interface/mc_if_od.h and the design
+ * rationale in Interface/CHANGELOG.md [5.5.0]. */
+static void apply_op_release_hold(axis_operation_t releasing_op)
+{
+    axis_op_mode_t target = s_axis.holding_enable ? AXIS_OP_MODE_HOLD
+                                                  : AXIS_OP_MODE_OFF;
+    if (s_axis.op_mode_commanded == target) return;    /* already there */
+    LOG_INFO("axis_manager: %s released -> op_mode %s -> %s (holding_enable=%u)",
+             op_name(releasing_op),
+             axis_mode_name(s_axis.op_mode_commanded),
+             axis_mode_name(target),
+             (unsigned)s_axis.holding_enable);
+    /* Route through the setter so the edge-detect log line + validation
+     * fire like any other mode change. */
+    (void)axis_manager_set_op_mode((uint8_t)target);
+}
+
 /* Completion detection for the active operation. Runs once per axis_manager
  * tick; clears s_active_op back to NONE when the current op finishes on its
  * own terms. */
@@ -405,6 +439,7 @@ static void tick_active_op(void)
              * or FAILED means the operation is complete. */
             if (home_sequencer_is_terminal_or_idle()) {
                 set_active_op(AXIS_OPERATION_NONE);
+                apply_op_release_hold(AXIS_OPERATION_HOMING);
             }
             return;
         case AXIS_OPERATION_SHOT_RECALL: {
@@ -415,13 +450,15 @@ static void tick_active_op(void)
             bool grace_active    = (time_elapsed_ms(s_active_op_started_ms) < AXIS_OP_ARRIVAL_GRACE_MS);
             if (motor_on_target && !motor_moving && !grace_active) {
                 set_active_op(AXIS_OPERATION_NONE);
+                apply_op_release_hold(AXIS_OPERATION_SHOT_RECALL);
             }
             return;
         }
         case AXIS_OPERATION_JOYSTICK: {
             /* Quiescent = stick centred AND motor stopped. Wait
-             * JOYSTICK_QUIESCENT_HOLD_MS of continuous quiescence before
-             * releasing so a mid-hold flap doesn't churn active_op. */
+             * s_axis.hold_dwell_ms of continuous quiescence before
+             * releasing so a mid-hold flap doesn't churn active_op.
+             * Dwell is operator-tunable via 0x3045 axis_hold_dwell_ms. */
             bool motor_moving = (s_axis.movement_status & MC_IF_MOVE_MOVING) != 0u;
             bool stick_zero   = (s_axis.joystick_value == 0.0f);
             if (motor_moving || !stick_zero) {
@@ -433,8 +470,9 @@ static void tick_active_op(void)
                 s_joystick_quiescent_since_ms = (now == 0u) ? 1u : now;   /* avoid 0-sentinel */
                 return;
             }
-            if (time_elapsed_ms(s_joystick_quiescent_since_ms) >= JOYSTICK_QUIESCENT_HOLD_MS) {
+            if (time_elapsed_ms(s_joystick_quiescent_since_ms) >= s_axis.hold_dwell_ms) {
                 set_active_op(AXIS_OPERATION_NONE);
+                apply_op_release_hold(AXIS_OPERATION_JOYSTICK);
             }
             return;
         }
@@ -572,8 +610,14 @@ static float current_velocity_demand_rad_s(void)
  *   v4 (2026-06-26): appended 3 bytes of LED indicator colour (R/G/B).
  *   v5 (2026-06-30): appended 1 byte axis_role (0x3070 CAMERAD_AXIS_*).
  *   v6 (2026-07-09): appended 1 byte home_on_boot (0x3043).
+ *   v7 (2026-07-22): appended 1 byte holding_enable (0x3044). v6 blobs load
+ *                    with the appended byte = 0 → apply-time promotes to
+ *                    the real default (1). No re-Save required.
+ *   v8 (2026-07-22): appended 2 bytes hold_dwell_ms (0x3045). v7 blobs load
+ *                    with the appended U16 = 0 → apply-time promotes to
+ *                    the default (200). No re-Save required.
  *============================================================================*/
-#define AXIS_PERSIST_VERSION   6u
+#define AXIS_PERSIST_VERSION   8u
 
 typedef struct __attribute__((packed)) {
     float    joystick_max_velocity;
@@ -588,6 +632,8 @@ typedef struct __attribute__((packed)) {
     uint8_t  led_rgb[3];                 /* v4: led_indicator colour */
     uint8_t  axis_role;                  /* v5: 0x3070 CAMERAD_AXIS_* bitmap */
     uint8_t  home_on_boot;               /* v6: 0x3043 axis_home_on_boot */
+    uint8_t  holding_enable;             /* v7: 0x3044 axis_holding_enable */
+    uint16_t hold_dwell_ms;              /* v8: 0x3045 axis_hold_dwell_ms */
 } axis_persist_blob_t;
 
 static void apply_persist_blob(const axis_persist_blob_t *b)
@@ -610,6 +656,19 @@ static void apply_persist_blob(const axis_persist_blob_t *b)
     if (s_axis.axis_role == 0u) s_axis.axis_role = 0x01u;  /* PAN default */
     /* v6: home_on_boot lives in home_sequencer; setter clamps to 0/1. */
     (void)home_sequencer_set_home_on_boot(b->home_on_boot);
+    /* v7: holding_enable. Verbatim copy with 0/1 clamp — an EXPLICIT
+     * operator zero (drive OFF after op release) must be respected. The
+     * v6→v7 upgrade case where the tail byte was zero-fill (never
+     * written by the operator) is handled by axis_manager_init using
+     * flash_ver, which promotes to the real default (1) only when we
+     * know the blob was actually upgraded. */
+    s_axis.holding_enable = (b->holding_enable != 0u) ? 1u : 0u;
+    /* v8: hold_dwell_ms. Verbatim copy — an EXPLICIT operator zero
+     * (instant release, no dwell) is a legitimate setting. The v7→v8
+     * upgrade case where the tail bytes are zero-fill is handled by
+     * axis_manager_init using flash_ver, which promotes to the default
+     * (200) only when we know the blob was actually upgraded. */
+    s_axis.hold_dwell_ms  = b->hold_dwell_ms;
     led_indicator_apply_persist(b->led_rgb);
     recompute_joystick_max_velocity();
 }
@@ -628,8 +687,10 @@ static void capture_persist_blob(axis_persist_blob_t *b)
     b->position_limit_hi_rad = s_axis.position_limit_hi_rad;
     b->accel_limit_rad_s2    = s_axis.accel_limit_rad_s2;
     led_indicator_capture_persist(b->led_rgb);
-    b->axis_role    = s_axis.axis_role;
-    b->home_on_boot = home_sequencer_get_home_on_boot();
+    b->axis_role      = s_axis.axis_role;
+    b->home_on_boot   = home_sequencer_get_home_on_boot();
+    b->holding_enable = s_axis.holding_enable;
+    b->hold_dwell_ms  = s_axis.hold_dwell_ms;
 }
 
 bool axis_manager_save_to_flash(void)
@@ -705,6 +766,8 @@ void axis_manager_init(void)
 
     s_axis.joy_profile            = AXIS_JOY_PROFILE_NORMAL;
     s_axis.axis_role              = 0x01u;                    /* CAMERAD_AXIS_PAN */
+    s_axis.holding_enable         = 1u;                       /* default: HOLD after op release; operator can flip to OFF via 0x3044 */
+    s_axis.hold_dwell_ms          = 200u;                     /* default: 200 ms quiescent hold before JOYSTICK op releases (0x3045) */
     s_axis.velocity_limit_rad_s   = 10.0f;
     recompute_joystick_max_velocity();   /* derived — needs velocity_limit + profile set first */
     s_axis.position_limit_lo_rad  = -INFINITY;
@@ -746,6 +809,21 @@ void axis_manager_init(void)
     if (persist_load_or_upgrade(PERSIST_REGION_CONFIG, &blob, sizeof(blob),
                                 AXIS_PERSIST_VERSION, &loaded, &flash_ver)) {
         apply_persist_blob(&blob);
+        /* v6 blobs upgraded to v7 have holding_enable zero-filled by the
+         * append-tail upgrade path. That zero is NOT an operator setting —
+         * it's the absence of one — so promote to the default (1 = HOLD).
+         * A blob explicitly saved at v7 with holding_enable=0 preserves
+         * the operator's intent verbatim. */
+        if (flash_ver < 7u) {
+            s_axis.holding_enable = 1u;
+        }
+        /* v7 blobs upgraded to v8 have hold_dwell_ms zero-filled — that
+         * zero would mean "instant release, no debounce," which is a
+         * legitimate operator choice for a later save but NOT what we want
+         * to inherit from an unset field. Promote to the default (200). */
+        if (flash_ver < 8u) {
+            s_axis.hold_dwell_ms = 200u;
+        }
         if (flash_ver == AXIS_PERSIST_VERSION) {
             LOG_INFO("axis_manager: ready (v%u, persisted config loaded). state=DISABLED",
                      (unsigned)flash_ver);
@@ -1226,6 +1304,18 @@ float axis_manager_get_joystick_value(void) { return s_axis.joystick_value; }
 bool  axis_manager_set_joystick_value(float v)
 {
     if (v < -1.0f || v > 1.0f) return false;
+    /* Op arbitration on the raw-jog entry points. Any non-zero deflection
+     * is a "jog request" that must arbitrate for the JOYSTICK op family;
+     * v=0 is "stop" and always writes through so a jog-then-centre gesture
+     * completes normally regardless of arbitration state. See the block
+     * comment on axis_manager_set_joystick_raw for the full rationale. */
+    if (v != 0.0f) {
+        axis_begin_result_t br = axis_manager_try_begin_op(AXIS_OPERATION_JOYSTICK);
+        if (br == AXIS_BEGIN_REJECTED) return false;
+        if (s_axis.op_mode_commanded != AXIS_OP_MODE_JOYSTICK) {
+            (void)axis_manager_set_op_mode((uint8_t)AXIS_OP_MODE_JOYSTICK);
+        }
+    }
     s_axis.joystick_value = v;
     return true;
 }
@@ -1246,6 +1336,30 @@ bool    axis_manager_set_joy_profile(uint8_t p)
     }
     s_axis.joy_profile = p;
     recompute_joystick_max_velocity();
+    return true;
+}
+
+uint8_t axis_manager_get_holding_enable(void) { return s_axis.holding_enable; }
+bool    axis_manager_set_holding_enable(uint8_t v)
+{
+    uint8_t nv = (v != 0u) ? 1u : 0u;
+    if (s_axis.holding_enable != nv) {
+        LOG_INFO("axis: holding_enable %u -> %u (op-release will transition to %s)",
+                 (unsigned)s_axis.holding_enable, (unsigned)nv,
+                 nv ? "HOLD" : "OFF");
+    }
+    s_axis.holding_enable = nv;
+    return true;
+}
+
+uint16_t axis_manager_get_hold_dwell_ms(void) { return s_axis.hold_dwell_ms; }
+bool     axis_manager_set_hold_dwell_ms(uint16_t v)
+{
+    if (s_axis.hold_dwell_ms != v) {
+        LOG_INFO("axis: hold_dwell_ms %u -> %u",
+                 (unsigned)s_axis.hold_dwell_ms, (unsigned)v);
+    }
+    s_axis.hold_dwell_ms = v;
     return true;
 }
 
@@ -1399,8 +1513,37 @@ bool     axis_manager_set_home_on_boot       (uint8_t v){ return home_sequencer_
  *============================================================================*/
 
 int32_t axis_manager_get_joystick_raw(void) { return s_axis.joystick_raw; }
+
+/* Op arbitration on the raw-jog entry point.
+ *
+ * ANY caller of this setter — CAMERAD's cmc_state_handle_movement_scaled,
+ * VISCA's cmd_pantilt_drive, buttons_jog, GUI OD-write to 0x3026, PC-tool
+ * scripts, whatever — routes through the JOYSTICK op arbiter here. Without
+ * this, direct OD writers (like the GUI joystick) bypass the arbiter, so
+ * s_active_op never enters JOYSTICK and tick_active_op's release logic
+ * never fires — meaning apply_op_release_hold's holding_enable transition
+ * doesn't happen when the operator lets go. Users see holding current after
+ * a GUI jog even with holding_enable=0. Placing arbitration here makes all
+ * three joystick sources equivalent.
+ *
+ * v = 0 is a "stop" / "centre stick" write and is ALWAYS allowed through
+ * without re-arbitrating — a jog-then-centre gesture completes normally,
+ * and the quiescent timer in tick_active_op then releases the op naturally.
+ *
+ * Callers who already arbitrate themselves (cmc_state_handle_movement_scaled,
+ * buttons_jog) will hit try_begin_op twice in quick succession — the second
+ * returns CONTINUED (same-family) which is a harmless no-op. Removing the
+ * caller-side arbitration is a valid follow-up cleanup but not required for
+ * correctness. */
 bool    axis_manager_set_joystick_raw(int32_t v)
 {
+    if (v != 0) {
+        axis_begin_result_t br = axis_manager_try_begin_op(AXIS_OPERATION_JOYSTICK);
+        if (br == AXIS_BEGIN_REJECTED) return false;
+        if (s_axis.op_mode_commanded != AXIS_OP_MODE_JOYSTICK) {
+            (void)axis_manager_set_op_mode((uint8_t)AXIS_OP_MODE_JOYSTICK);
+        }
+    }
     s_axis.joystick_raw = v;
     recompute_joystick_value_from_raw();
     return true;

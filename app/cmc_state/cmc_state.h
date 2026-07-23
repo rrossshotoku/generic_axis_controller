@@ -116,6 +116,14 @@ bool     cmc_state_moving            (void);
  * On success populates *out. */
 bool cmc_state_get_shot(uint32_t shot_no, cmc_shot_t *out);
 
+/* Update just the stored time on an existing shot slot. Used by VISCA's
+ * per-preset duration commands (vendor extension 7E 04 67) which set
+ * the fade duration in a separate frame from the position-store frame.
+ * Auto-saves to flash on success. Returns false if shot_no is out of
+ * range or the slot is empty (never stored) — operator must Store the
+ * position first, then set the time. */
+bool cmc_state_set_shot_time_tenths(uint32_t shot_no, uint32_t tenths);
+
 /* Persist the current shot table to flash. Returns true on success.
  * Called automatically after every store; callable manually too (via
  * OD 0x3051 cmc_save_shots) e.g. after a PC-tool batch edit. */

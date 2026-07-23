@@ -289,6 +289,10 @@ typedef enum
     X(0x2200, 2, pos_ki,                      MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2200, 3, pos_kd,                      MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2200, 4, velocity_ff_gain,            MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    /* position_deadband_rad: no velocity correction within +/- this of the target, so the axis PARKS  */ \
+    /* instead of hunting/creeping on tiny errors (ADR-071). Continuous (subtracts the band outside).  */ \
+    /* 0 = disabled (default). Keep below the target-reached window (0.01 rad).                          */ \
+    X(0x2200, 5, position_deadband_rad,       MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     /* --- 0x2300 velocity controller + telemetry --- */ \
     X(0x2300, 1, vel_kp,                      MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2300, 2, vel_ki,                      MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
@@ -303,11 +307,26 @@ typedef enum
     X(0x2300, 6, vel_accel_up,                MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2300, 7, vel_accel_dn,                MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2300, 8, vel_accel_jerk,              MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
-    /* Holding enable (ADR-054): 1 = hold when stopped (the PI provides whatever current is needed); 0 = */ \
-    /* release the held current ~1 s after the axis settles at zero speed. Boolean -- not a current value. */ \
+    /* Holding enable -- DEPRECATED / ADVISORY ONLY since REQ-0016 (motor ADR-072). The motor no longer */ \
+    /* acts on this: it always holds when enabled, and idle policy (hold vs disable the drive on a move */ \
+    /* release) is owned by the CMC via 0x3044 axis_holding_enable -> op_mode HOLD/OFF. Kept for read     */ \
+    /* compat; slated for removal at the next wire-breaking version. (was ADR-054: 0 = release after ~1 s) */ \
     X(0x2300, 9, holding_enable,              MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     /* jog_position_mode: 0 = PROFILE_VELOCITY runs the velocity loop directly (default); 1 = integrate the velocity setpoint into a position reference + run the position cascade (following-error / soft-limit / stiff-hold protection while jogging). (ADR-062) */ \
     X(0x2300, 10, jog_position_mode,          MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    /* Stop-integrator bleed (ADR-074): when ENABLED, commanded to stop (demand ~0) and |velocity| <     */ \
+    /* v_th, fast-unwind the velocity-loop integrator so its wound-up brake can't push past zero into a  */ \
+    /* reverse (the on-camera recoil at the end of a jog). v_th [rad/s] arms it; factor sets the unwind  */ \
+    /* speed as a multiple of ki (per-tick fraction = factor*ki*dt; 2 = twice as fast). Self-scopes to   */ \
+    /* stops (jog); inert on shot-recall. Off by default via :13 enable.                                 */ \
+    X(0x2300, 11, vel_stop_bleed_v_th,        MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2300, 12, vel_stop_bleed_factor,      MC_IF_T_F32, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    X(0x2300, 13, vel_stop_bleed_enable,      MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
+    /* vel_accel_scurve (ADR-075): 1 = anticipatory jerk-limited S-curve on the velocity-demand ramp -- */ \
+    /* rounds BOTH ends (accel eased to 0 as velocity reaches the setpoint, no overshoot, no accel      */ \
+    /* discontinuity) by holding accel on the phase-plane boundary a=sqrt(2*jerk*|remaining|). 0 =       */ \
+    /* the ramp-up-only free-fall behaviour of ADR-042 (default). Reuses vel_accel_jerk (0x2300:8).      */ \
+    X(0x2300, 14, vel_accel_scurve,           MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_MOTOR) \
     X(0x2310, 1, tlm_vel_demand_rad_s,        MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2310, 2, tlm_vel_actual_rad_s,        MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
     X(0x2310, 3, tlm_vel_iq_cmd_a,            MC_IF_T_F32, MC_IF_A_RO, MC_IF_F_PDO,     MC_IF_OWNER_MOTOR) \
@@ -530,6 +549,33 @@ typedef enum
     /* tunables (PERSIST_REGION_CONFIG). Operator writes 0/1 via PC tool /  */ \
     /* web UI, then Save to flash. Only fires if motor is not in bootloader.*/ \
     X(0x3043, 0, axis_home_on_boot,           MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC) \
+    /* --- 0x3044 axis_holding_enable — CMC-owned, replaces motor's 0x2300:9. */ \
+    /* When 0, the CMC transitions op_mode -> OFF (drive fully disabled) on   */ \
+    /* every op release (JOYSTICK / SHOT_RECALL / HOMING). When 1 (default),  */ \
+    /* transitions to HOLD (motor decelerates via HALT bit, then holds via    */ \
+    /* velocity loop at zero setpoint).                                       */ \
+    /*                                                                        */ \
+    /* Design: for high-stiction actuators, a small commanded voltage that    */ \
+    /* reads as ~0 A on the current sensor can still cause drift; OFF is      */ \
+    /* the only truly quiet state. Actuators without that issue benefit from  */ \
+    /* HOLD (no re-enable latency on the next op). Applied uniformly across   */ \
+    /* op families so behaviour is consistent regardless of which op released.*/ \
+    /*                                                                        */ \
+    /* Persisted in the axis_persist blob (v6 -> v7 append). Supersedes the   */ \
+    /* motor-owned 0x2300:9 which becomes advisory/deprecated pending the     */ \
+    /* motor firmware update tracked in REQUESTS.md.                          */ \
+    X(0x3044, 0, axis_holding_enable,         MC_IF_T_U8,  MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC) \
+    /* --- 0x3045 axis_hold_dwell_ms — dwell before op-release transition.  */ \
+    /* After the joystick stops requesting (joystick_value = 0) AND the     */ \
+    /* motor reports MOVING cleared, the CMC waits this many milliseconds   */ \
+    /* of continuous quiescence before transitioning op_mode via            */ \
+    /* holding_enable. Default 200 ms. Range 0..65535: 0 = instant (no      */ \
+    /* dwell); larger values debounce brief flap-back gestures more         */ \
+    /* aggressively at the cost of feeling less responsive on release.      */ \
+    /* Applied to JOYSTICK op release; SHOT_RECALL and HOMING release       */ \
+    /* immediately on their own arrival criteria (no dwell). Persisted in   */ \
+    /* axis_persist blob v7 -> v8.                                          */ \
+    X(0x3045, 0, axis_hold_dwell_ms,          MC_IF_T_U16, MC_IF_A_RW, MC_IF_F_PERSIST, MC_IF_OWNER_CMC) \
     /* --- 0x3070 axis_role — which CAMERAD movement axis this physical CMC \
      * consumes from every MOVEMENT frame. Values mirror CAMERAD_AXIS_* \
      * bitmap: 0x01=PAN, 0x02=TILT, 0x04=ZOOM, 0x08=FOCUS, 0x10=X, 0x20=Y, \

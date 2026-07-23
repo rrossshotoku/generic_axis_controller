@@ -163,6 +163,8 @@ MC_IfOdResult_t cmc_od_read(uint16_t idx, uint8_t sub,
     case 0x3041: READ_U8(axis_manager_get_home_status());
     case 0x3042: READ_U8(axis_manager_is_homed() ? 1u : 0u);
     case 0x3043: READ_U8(axis_manager_get_home_on_boot());
+    case 0x3044: READ_U8(axis_manager_get_holding_enable());
+    case 0x3045: READ_U16(axis_manager_get_hold_dwell_ms());
     case 0x3070: READ_U8(axis_manager_get_axis_role());
     case 0x3080: READ_U8(config_get_active_protocol());
 
@@ -422,6 +424,18 @@ static MC_IfOdResult_t cmc_od_write_inner(uint16_t idx, uint8_t sub,
         sz = check_write_size(MC_IF_T_U8, in_len); if (sz != MC_IF_OD_OK) return sz;
         if (in_type != MC_IF_T_U8) return MC_IF_OD_ERR_TYPE;
         WRITE_OK_OR(axis_manager_set_home_on_boot(get_u8(in_data)));
+
+    /* --- 0x3044 axis_holding_enable — persisted 0/1 idle-behaviour flag. */
+    case 0x3044:
+        sz = check_write_size(MC_IF_T_U8, in_len); if (sz != MC_IF_OD_OK) return sz;
+        if (in_type != MC_IF_T_U8) return MC_IF_OD_ERR_TYPE;
+        WRITE_OK_OR(axis_manager_set_holding_enable(get_u8(in_data)));
+
+    /* --- 0x3045 axis_hold_dwell_ms — JOYSTICK op-release quiescent hold. */
+    case 0x3045:
+        sz = check_write_size(MC_IF_T_U16, in_len); if (sz != MC_IF_OD_OK) return sz;
+        if (in_type != MC_IF_T_U16) return MC_IF_OD_ERR_TYPE;
+        WRITE_OK_OR(axis_manager_set_hold_dwell_ms(get_u16(in_data)));
 
     /* --- 0x3070 axis_role — CAMERAD_AXIS_* bitmap (single bit). */
     case 0x3070:

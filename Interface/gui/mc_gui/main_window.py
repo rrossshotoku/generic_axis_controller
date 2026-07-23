@@ -1200,6 +1200,24 @@ class MainWindow(QMainWindow):
                 # 32=Y 64=HEIGHT 128=FADER. Persisted in axis_persist blob.
                 (0x3070, 0),
             ]),
+            ("Idle behaviour", [
+                # holding_enable (0x3044) — CMC-owned (Interface v5.5.0),
+                # replaces motor's now-deprecated 0x2300:9. On every op-family
+                # release (JOYSTICK / SHOT_RECALL / HOMING → NONE): 1 →
+                # transition op_mode to HOLD (drive stays enabled, holds at
+                # zero velocity); 0 → transition to OFF (drive fully disabled,
+                # back-drivable). Choose 0 for actuators where sub-sensor-
+                # threshold voltage causes drift; 1 for anything that must
+                # resist backdrive. Persisted in axis_persist blob v7.
+                (0x3044, 0),
+                # hold_dwell_ms (0x3045) — CMC-owned (Interface v5.6.0). After
+                # the joystick centres AND the motor's MOVING bit clears, the
+                # CMC waits this many ms of continuous quiescence before
+                # releasing the JOYSTICK op + applying the holding_enable
+                # transition. Debounces flap-back gestures. Range 0..65535;
+                # default 200. Persisted in axis_persist blob v8.
+                (0x3045, 0),
+            ]),
         ]
 
         w = QWidget()
@@ -1868,13 +1886,24 @@ class MainWindow(QMainWindow):
         ]),
         ("Position loop gains (0x2200)", [
             (0x2200, 1), (0x2200, 2), (0x2200, 3), (0x2200, 4),  # :4 = velocity_ff_gain (ADR-031)
+            (0x2200, 5),   # position_deadband_rad — no correction within +/- this of target; 0 = off (ADR-071)
         ]),
         ("Velocity loop gains (0x2300)", [
             (0x2300, 1), (0x2300, 2), (0x2300, 3), (0x2300, 4),
             (0x2300, 5),  # vel_load_factor (REQ-0014) — operator load multiplier on kp/ki
-            (0x2300, 6), (0x2300, 7), (0x2300, 8),   # velocity-demand accel ramp: caps + ramp-up jerk (ADR-042)
-            (0x2300, 9),   # holding_enable (U8): 1 = hold when stopped, 0 = release held current after settle (ADR-054)
+            # 0x2300:9 holding_enable deprecated in Interface v5.5.0 — the CMC
+            # now owns the idle-behaviour decision via 0x3044 axis_holding_enable
+            # (shown on the CMC Setup tab). Motor-owned entry is advisory
+            # (Interface/REQUESTS.md REQ-0016).
+            # Jog feel / accel-ramp / stop knobs live in "Jog parameters" below.
+        ]),
+        ("Jog parameters (0x2300)", [
             (0x2300, 10),  # jog_position_mode (U8): 0 = direct velocity jog, 1 = position-integrated jog (ADR-062)
+            (0x2300, 6), (0x2300, 7), (0x2300, 8),  # velocity-demand accel ramp: accel_up / accel_dn / ramp-up jerk (ADR-042)
+            (0x2300, 14),  # vel_accel_scurve (U8): 1 = anticipatory jerk-limited S-curve ramp (rounds both ends); 0 = ADR-042 free-fall (ADR-075)
+            (0x2300, 13),  # vel_stop_bleed_enable (U8): 1 = enable the stop-integrator bleed (anti-recoil at the end of a jog), 0 = off (ADR-074)
+            (0x2300, 11),  # vel_stop_bleed_v_th [rad/s] — arm the bleed below this speed
+            (0x2300, 12),  # vel_stop_bleed_factor — unwind speed as a factor of ki (2 = twice as fast)
         ]),
         ("Current loop gains (0x2400)", [
             (0x2400, 1), (0x2400, 2), (0x2400, 3), (0x2400, 4), (0x2400, 5),
@@ -2078,6 +2107,7 @@ class MainWindow(QMainWindow):
             "Motor model (0x2000)": "char",
             "Position loop gains (0x2200)": "loops",
             "Velocity loop gains (0x2300)": "loops",
+            "Jog parameters (0x2300)": "loops",
             "Current loop gains (0x2400)": "loops",
             "State estimator (0x2500)": "loops",
             "Notch filter — current command (0x2930)": "loops",

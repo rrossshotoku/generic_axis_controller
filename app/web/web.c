@@ -403,7 +403,8 @@ static void build_config_json(void)
             "\"encoder_incremental\":%u,"
             "\"is_homed\":%u,"
             "\"home_status\":%u,"
-            "\"role\":%u"
+            "\"role\":%u,"
+            "\"holding_enable\":%u"
           "}"
         "}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
@@ -429,7 +430,8 @@ static void build_config_json(void)
         (unsigned)(axis_manager_encoder_is_incremental() ? 1u : 0u),
         (unsigned)(axis_manager_is_homed() ? 1u : 0u),
         (unsigned)axis_manager_get_home_status(),
-        (unsigned)axis_manager_get_axis_role());
+        (unsigned)axis_manager_get_axis_role(),
+        (unsigned)axis_manager_get_holding_enable());
 
     if (n < 0 || (size_t)n >= sizeof(s_tx_buf)) {
         send_500("json too large");
@@ -551,13 +553,17 @@ static void apply_config_json(const char *json)
         if ((p = find_key(dyn, "load_factor")) && parse_f32(p, &f)) (void)axis_manager_set_load_factor(f);
     }
 
-    /* axis — currently just role (which CAMERAD MOVEMENT field this CMC
-     * consumes). Applied live; persists on the next Save all to flash. */
+    /* axis — role (which CAMERAD MOVEMENT field this CMC consumes) +
+     * holding_enable (idle-behaviour: HOLD or OFF after op release).
+     * Applied live; persists on the next Save all to flash. */
     const char *ax = find_key(json, "axis");
     if (ax && *ax == '{') {
-        const char *p; int32_t i;
+        const char *p; int32_t i; uint32_t u;
         if ((p = find_key(ax, "role")) && parse_i32(p, &i) && i > 0 && i <= 0xFF) {
             (void)axis_manager_set_axis_role((uint8_t)i);
+        }
+        if ((p = find_key(ax, "holding_enable")) && parse_u32(p, &u)) {
+            (void)axis_manager_set_holding_enable((uint8_t)u);
         }
     }
 

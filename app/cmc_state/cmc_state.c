@@ -299,6 +299,33 @@ int cmc_state_store_shot(uint32_t shot_no)
     return (int)idx;
 }
 
+bool cmc_state_set_shot_time_tenths(uint32_t shot_no, uint32_t tenths)
+{
+    if (!valid_shot_no(shot_no)) {
+        LOG_WARN("cmc_state: set_shot_time bad shot_no=%lu",
+                 (unsigned long)shot_no);
+        return false;
+    }
+    uint32_t idx = shot_no - 1u;
+    if (!s_shots[idx].valid) {
+        LOG_WARN("cmc_state: set_shot_time shot %lu is empty — Store first",
+                 (unsigned long)shot_no);
+        return false;
+    }
+    /* Update just the time field; leave position intact. */
+    float t_s = (float)tenths * 0.1f;
+    s_shots[idx].time_to_shot_s = t_s;
+    LOG_INFO("cmc_state: SET_TIME shot %lu t=%lu tenths (%ld ms)",
+             (unsigned long)shot_no, (unsigned long)tenths,
+             (long)lroundf(t_s * 1000.0f));
+    /* Persist same as store_shot does — one flash write per operation.
+     * Two-step "Store then Set-Time" costs two 60 ms writes; if that
+     * becomes a wear concern, batch the save in a future dirty-flag
+     * pattern. */
+    (void)cmc_state_save_shots();
+    return true;
+}
+
 uint32_t cmc_state_store_next(void)
 {
     uint32_t next = (s_current_shot > 0u && s_current_shot < CMC_MAX_SHOTS)

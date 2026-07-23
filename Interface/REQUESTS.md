@@ -902,3 +902,54 @@ Everything else is a mirror of the CMC-side implementation, adjusted for your ch
 - **Segment sizing:** motor accepts up to `MC_IF_MAX_PAYLOAD − 3` = 49 data bytes/segment (64 B frame). Same as the CMC.
 
 Open: on-target bring-up on the motor board (`make -C boot`, flash, run the end-to-end checklist in `boot/README.md`).
+
+---
+
+## REQ-0016: Deprecate `0x2300:9 holding_enable` — CMC now owns idle-behaviour decision
+- **Source**: `Lightweight_CMC` (network MCU)
+- **Target**: `Generic_motor_controller` (motor MCU)
+- **Status**: in-progress — motor side implemented (ADR-072); pending on-target end-to-end acceptance
+- **Opened**: 2026-07-22
+- **Closed**: -
+- **Priority**: functional
+
+### Why
+
+The motor's autonomous "release holding current after ~1 s dwell at zero velocity" logic (behind `0x2300:9 holding_enable`, ADR-054) is now redundant with the CMC's op-arbitration layer. Splitting the "when to release the drive" decision across two owners (motor's dwell timer + CMC's arbiter) is a form of implicit state — hard to reason about and hard to test.
+
+The CMC has taken over as the single source of truth via a new CMC-owned entry **`0x3044 axis_holding_enable`** (Interface v5.5.0). On every op-family release (JOYSTICK / SHOT_RECALL / HOMING → NONE), the CMC now explicitly transitions `op_mode`:
+
+- `0x3044 = 1` (default) → `op_mode = HOLD` (motor decelerates via HALT bit and holds at zero velocity)
+- `0x3044 = 0`           → `op_mode = OFF` (drive disabled — needed for high-stiction actuators where sub-sensor-threshold voltage causes drift)
+
+Once this request is done, the motor stops making autonomous decisions about holding — it just does what the CMC's op_mode + controlword say, which is what a servo should do.
+
+### What's needed
+
+1. **Remove the autonomous 1-second-dwell release logic** currently triggered by `0x2300:9 = 0` at zero measured velocity. The motor should no longer independently drop its holding current — it should hold whatever the CMC's current op_mode implies until the CMC changes op_mode.
+
+2. **Preserve reads of `0x2300:9`** for one release cycle so the CMC's bootsync (if it ever proxies this entry) doesn't error. Value can be anything (0 or 1); it's advisory-only from this point on.
+
+3. **Optional: delete `0x2300:9`** entirely in the next protocol version bump (v6.0.0 or later — this is a wire-visible OD entry removal, so it needs a version bump and coordination with the CMC + PC tool). Not required for functional completion of this request; can be deferred.
+
+4. **Motor firmware CHANGELOG entry** noting the autonomous logic removal.
+
+### Acceptance
+
+End-to-end on real hardware with both firmwares updated:
+
+- Set CMC `0x3044 = 1`, jog the axis via joystick, release. Motor stays at zero velocity WITH holding current for the whole quiescent period. Repeat with a shot recall — motor holds at target indefinitely.
+- Set CMC `0x3044 = 0`, jog the axis, release. Motor's ENABLE bit drops within ~200 ms of the stick centring (CMC's arbiter quiescent window). Statusword goes RUNNING → READY / DISABLED. No holding current. Repeat with shot recall — motor arrives at target, then drive disables.
+- Verify motor's `0x2300:9` value is IRRELEVANT to observed behaviour: try setting it to 0 with CMC `0x3044 = 1` — motor should still hold (per CMC's command), not release autonomously.
+- Motor `command_counter` dead-man still triggers on CMC crash (safety net unchanged — not related to this request but worth confirming in the test).
+
+### Discussion
+
+- CMC-side implementation shipped in commit `<TBD after this commit lands>`. See `app/axis_manager/axis_manager.c` `apply_op_release_hold()` and `tick_active_op()`.
+- Interface CHANGELOG entry: `[5.5.0]` — additive only, so no wire-breaking change until the eventual `0x2300:9` deletion.
+- **Interim state is safe**: with the CMC now commanding op_mode → OFF explicitly on release (`0x3044 = 0` case), the motor's autonomous release becomes a no-op — the drive is already disabled by the time the 1-second dwell would fire. For the `0x3044 = 1` case, if the operator forgot to also flip motor's `0x2300:9` to 1, the motor's release logic would still fire and defeat the CMC's HOLD intent. Recommend motor team set factory default of `0x2300:9 = 1` (always hold) once the autonomous logic is removed, so leftover PERSIST values from earlier motor firmwares don't cause surprises.
+- 2026-07-22 (Lightweight_CMC): request opened alongside the CMC-side implementation. Ready for motor team to pick up.
+
+- 2026-07-22 (Generic_motor_controller, ADR-072): **motor side implemented.** Removed the autonomous 1 s dwell-release logic entirely (`s_hold_released`/`s_hold_settle_ticks` state, `MC_HOLD_RELEASE_TICKS`/`MC_HOLD_SETTLED_EPS`, the velocity-cascade release block + its entry reset). The velocity cascade now always runs the controller when active → the motor **always holds while enabled**; the drive disables only when the CMC drops the enable (op_mode = OFF → controlword → `vel_active` false → fast-loop safe-off — a clean off, no current-loop hunting). **Pt 1 done, pt 2 done** (`0x2300:9` kept, advisory-only, PERSIST, default 1; never consulted). **Pt 3 (OD deletion) deferred** to a wire-breaking version. Improvement on the interim-safety note: since the logic is *gone*, a leftover PERSIST `0x2300:9 = 0` from old firmware is now a **no-op** — no need to force the default (already 1 anyway). Contract comment on `0x2300:9` marked DEPRECATED/advisory; CHANGELOG deprecation note flipped to done. Build clean, `app.bin` 91924 B (build+review only — no hardware here). **Pending:** the on-target acceptance (both firmwares) below — flip to `done` once verified.
+
+- 2026-07-22 (Generic_motor_controller): **housekeeping flag** — the CHANGELOG has a **duplicate `[5.5.0]`**: motor `tlm_v_arm_v` (2026-07-15) and this CMC `0x3044` entry (2026-07-22). The two teams' version lines collided during sync; the motor-side additive entries have since run 5.6.0–5.9.0. Needs a one-time reconciliation of the CHANGELOG version numbering between the copies (owner's call — not touched here to avoid clobbering the CMC's copy).

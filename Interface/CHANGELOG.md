@@ -23,6 +23,45 @@ This is the **authoritative change history** for the shared inter-MCU boundary c
 
 ---
 
+## [5.11.0] - 2026-07-23  (wire-breaking? no — additive motor-owned OD entry)
+
+### Added
+- **`0x2300:14 vel_accel_scurve`** (U8 RW PERSIST, motor-owned, ADR-075): **anticipatory jerk-limited (S-curve) velocity ramp**. `1` rounds **both** ends of the joystick/velocity-demand ramp — the acceleration is held on the phase-plane braking boundary `a = sqrt(2·jerk·|remaining|)` so it eases to zero *exactly* as the velocity reaches the setpoint: no overshoot **and** no acceleration discontinuity at the setpoint (the current ADR-042 ramp jerk-limits only the accel *rise* and lets it free-fall, which is discontinuous at the top). Re-planned every tick against the live target, so a moving stick just re-tracks, jerk-bounded. Reuses `vel_accel_jerk` (`0x2300:8`) as the jerk cap. `0` = the existing ADR-042 free-fall behaviour (**default**).
+
+### Consumers to update
+- motor-control MCU: implemented (`vel_slew_limit` S-curve path; config via `od_apply_gains`). Rebuild + reflash.
+- network MCU: none — motor-owned.
+- PC tool: re-parse `mc_if_od.h`; appears in the new Motor Config → Control loops → **"Jog parameters"** group (the jog feel / accel-ramp / stop knobs from 0x2300 were regrouped there). No PDO.
+
+---
+
+## [5.10.0] - 2026-07-23  (wire-breaking? no — additive motor-owned OD entries)
+
+### Added
+- **`0x2300:11-13 vel_stop_bleed_*`** (motor-owned, ADR-074): velocity-loop **stop-integrator bleed**. When enabled, the axis commanded to stop (velocity demand ≈ 0) and `|velocity| < v_th`, the velocity PI's integrator is fast-unwound so its wound-up braking can't push the velocity past zero into a brief **reverse** (the on-camera recoil at the end of a jog). The proportional term alone then brakes to rest without overshoot. Gated on the *demand*, so it engages firmly on a jog stop but only fleetingly at a shot-recall landing (demand kisses zero then goes negative to correct) — leaving the position loop free to land on target.
+  - `:11 vel_stop_bleed_v_th` (F32 RW PERSIST) — velocity [rad/s] below which it arms.
+  - `:12 vel_stop_bleed_factor` (F32 RW PERSIST) — unwind speed as a **factor of ki** (per-tick fraction removed = `factor·ki·dt`; **2 = twice as fast**). Ties the bleed to the windup timescale and auto-disables when `ki = 0`.
+  - `:13 vel_stop_bleed_enable` (U8 RW PERSIST) — master on/off, **0 = off** (default).
+
+### Consumers to update
+- motor-control MCU: implemented (`mc_velocity_controller` bleeds `pid.integrator`; config via `od_apply_gains`). Rebuild + reflash.
+- network MCU: none — motor-owned.
+- PC tool: re-parse `mc_if_od.h`; the three entries appear in Motor Config → Control loops → "Velocity loop gains". No PDO.
+
+---
+
+## [5.9.0] - 2026-07-22  (wire-breaking? no — additive motor-owned OD entry)
+
+### Added
+- **`0x2200:5` position_deadband_rad** (motor-owned, ADR-071): a position-error deadband — the position loop issues no velocity correction within ±this of the target, so the axis parks instead of hunting/creeping on tiny errors. Continuous form (subtracts the band outside it, so the correction reaches 0 smoothly at the edge — no velocity step). F32 RW PERSIST, **0 = disabled** (default). Keep below the target-reached window (0.01 rad).
+
+### Consumers to update
+- motor-control MCU: implemented (`mc_position_controller` applies it before the following-error clamp; value via `od_apply_gains`). Rebuild + reflash.
+- network MCU: none — motor-owned.
+- PC tool: re-parse `mc_if_od.h`; appears in Motor Config → Control loops → "Position loop gains". No PDO.
+
+---
+
 ## [5.8.0] - 2026-07-22  (wire-breaking? no — additive motor-owned OD entry)
 
 ### Added
@@ -96,6 +135,43 @@ No `MC_IF_PROTOCOL_VERSION` bump — additive, motor-owned.
 - PC tool: re-parse `mc_if_od.h` (the new entries appear automatically); adds a **thermal calculator** (Tools tab) that derives `I_cont`/`tau` from a continuous or duty spec and writes `0x2100:1/2/3`.
 
 No `MC_IF_PROTOCOL_VERSION` bump — additive, motor-owned, non-PDO (matches the `0x2300:10 jog_position_mode` precedent).
+
+## [5.6.0] - 2026-07-22  (wire-breaking? no — additive CMC-owned OD entry)
+
+### Added
+- **`0x3045 axis_hold_dwell_ms`** (U16 RW PERSIST, CMC-owned): dwell time in milliseconds between "JOYSTICK op has gone quiescent (stick centred + motor MOVING cleared)" and "release the op + apply holding_enable transition." Replaces the previously hardcoded `JOYSTICK_QUIESCENT_HOLD_MS = 200`. Range 0..65535. Default 200 ms. Only applies to the JOYSTICK op release; SHOT_RECALL and HOMING have their own arrival criteria and release immediately without dwell.
+
+  **Why:** operators with different actuators want different debounce windows — a rig with a heavy payload benefits from a longer dwell so a brief flap-back gesture doesn't churn `op_mode` (which would cost a re-enable latency + re-arm of the setup sequencer), while a lightweight tally wants faster release for responsiveness. Value is per-CMC and persisted.
+
+### Consumers to update
+- **motor-control MCU**: none — CMC-owned entry, motor sees no change.
+- **network MCU** (this project): implemented alongside this entry.
+- **PC tool**: reachable via the generic per-slot OD editor; a labelled row is exposed in the CMC Setup tab's "Idle behaviour" group.
+
+Note: CMC's `axis_persist_blob` bumps v7 → v8 (appends 2 bytes). `persist_load_or_upgrade` handles the migration transparently — v7 blobs load with `hold_dwell_ms = 0` from the zero-filled tail; `axis_manager_init` detects `flash_ver < 8` and promotes to the default (200) rather than accepting the accidental 0.
+
+---
+
+## [5.5.0] - 2026-07-22  (wire-breaking? no — additive CMC-owned OD entry; motor entry deprecated)
+
+### Added
+- **`0x3044 axis_holding_enable`** (U8 RW PERSIST, CMC-owned): idle-behaviour selector. When `0`, the CMC transitions `op_mode → OFF` (drive disabled) after every op release (JOYSTICK / SHOT_RECALL / HOMING); when `1` (default), transitions to `HOLD` (motor decelerates via HALT bit, holds via velocity loop). Applied uniformly across op families for consistent behaviour.
+
+  **Rationale:** for high-stiction actuators, a small commanded voltage that reads as ~0 A on the current sensor can still cause slow drift — OFF is the only truly quiet state. Actuators without stiction benefit from HOLD (no re-enable latency on next op). The choice belongs to the operator, per-CMC.
+
+  **Architectural shift:** this responsibility used to belong to the motor MCU's autonomous "release holding current after 1 s dwell" logic behind `0x2300:9` (ADR-054). Making the CMC own it gives a single source of truth (the same layer that already owns op arbitration + mode+targets), removes the hidden dwell timing on the motor side, and makes the release deterministic against op-family transitions rather than settled-velocity time.
+
+### Deprecated (advisory only; not removed)
+- **`0x2300:9 holding_enable`** (motor-owned) — **DONE on the motor side (ADR-072, REQ-0016):** the autonomous release-after-1s logic is removed; the motor now always holds while enabled and the entry is advisory-only (readable/writable/PERSIST, never consulted). A leftover PERSIST `0` is now harmless. Full OD removal deferred to the next wire-breaking version.
+
+### Consumers to update
+- **motor-control MCU**: **done** — autonomous logic removed (ADR-072); idle behaviour follows the CMC's op_mode (HOLD/OFF). `0x2300:9` kept for read-compat only.
+- **network MCU** (this project): implemented alongside this entry.
+- **PC tool**: optional GUI toggle; reachable via the generic per-slot OD editor at 0x3044.
+
+Note: CMC's `axis_persist_blob` bumps v6 → v7 (appends one byte). `persist_load_or_upgrade` handles the migration transparently — v6 blobs load with `holding_enable = 0` on the low byte of the appended slot, which apply-time promotes to the real default (1). No operator re-Save required.
+
+---
 
 ## [5.4.0] - 2026-07-22  (wire-breaking? no — additive CMC-owned OD entry)
 

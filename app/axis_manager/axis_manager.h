@@ -138,6 +138,23 @@ bool     axis_manager_encoder_is_incremental    (void);        /* true iff NOT_H
 uint8_t  axis_manager_get_home_on_boot          (void);        /* 0x3043 */
 bool     axis_manager_set_home_on_boot          (uint8_t v);   /* 0x3043 (0/1) */
 
+/* 0x3044 axis_holding_enable — CMC-owned idle-behaviour selector.
+ * On any op release (JOYSTICK/SHOT_RECALL/HOMING → NONE): 1 → transition
+ * to HOLD (motor decelerates via HALT + holds at zero velocity);
+ * 0 → transition to OFF (drive fully disabled, back-drivable). Choose 0
+ * for actuators with stiction that drift under small residual voltage
+ * (drive-off is the only quiet state); choose 1 for anything that needs
+ * to resist backdrive. Supersedes motor-owned 0x2300:9 (deprecated). */
+uint8_t  axis_manager_get_holding_enable        (void);        /* 0x3044 */
+bool     axis_manager_set_holding_enable        (uint8_t v);   /* 0x3044 (0/1) */
+
+/* 0x3045 axis_hold_dwell_ms — how long the JOYSTICK op stays quiescent
+ * (joystick_value = 0 AND motor MOVING cleared) before we release it +
+ * apply the holding_enable transition. Debounces brief flap-back
+ * gestures. Range 0..65535 ms; 0 = instant release. Default 200. */
+uint16_t axis_manager_get_hold_dwell_ms         (void);        /* 0x3045 */
+bool     axis_manager_set_hold_dwell_ms         (uint16_t v);  /* 0x3045 */
+
 /* --- 0x3010-0x301F commands (write-triggered) --- */
 bool  axis_manager_request_enable           (bool enable);  /* 0x3010 write 1/0 */
 bool  axis_manager_request_quick_stop       (void);         /* 0x3011 write 1 — hard decel + disable */

@@ -25,6 +25,10 @@ Position scaling: 1 VISCA unit = 1 milliradian. int16 range ±32.767 rad ≈ ±1
 | `81 01 06 04 FF` | `Pan_tiltHome` | Runs the endstop homing procedure (`axis_manager_request_home`). See "Semantics note" below. |
 | `81 01 04 3F 01 pp FF` | `Memory_Set (Store)` | Store current position at preset `pp` (0..99 → shot 1..100). `cmc_state_store_shot`. Auto-saves to flash. |
 | `81 01 04 3F 02 pp FF` | `Memory_Recall` | Fade to preset `pp` using slot's stored `time_to_shot_s` (0 → `FADE_MIN_TIME_S` default). `cmc_state_move_to_shot(shot_no, is_cut=false)`. Rejected if not homed. |
+| `81 01 7E 04 3D pp FF` | Sony-ext position-preset mode | No-op ACK — this CMC is position-only anyway. |
+| `81 01 7E 04 1B pp FF` | Sony-ext per-preset-settings mode | No-op ACK — every slot already has its own `time_to_shot_s`. |
+| `81 01 7E 04 27 pp mm FF` | Sony-ext preset mode select (speed vs duration) | No-op ACK — CMC always uses per-slot duration. |
+| `81 01 7E 04 67 pp 0q 0q 0q FF` | Sony-ext preset duration | 12-bit duration in 0.1 s units → `cmc_state_set_shot_time_tenths(pp+1, tenths)`. Sony's documented range 1.0..99.0 s; values outside that log a WARN but are accepted. |
 
 ## Semantics note: Pan_tiltHome
 
@@ -54,6 +58,14 @@ If a real "go to 0" is needed alongside, store preset 0 (shot 1) at the desired 
 - Command replies are TWO packets (ACK, then Completion), matching real cameras.
 - No TCP. No serial.
 - Reuses W6100 socket 0 (same physical socket as `controller_mgr`'s CAMERAD POLL). Safe because the two mgrs are mutually exclusive at boot.
+
+## Device address
+
+Sourced from **`cmc_device_no`** in the shared network config (web page: "CMC device #"). CAMERAD also uses this value as its advertised `return_device_no`, so operators only set one number for "this CMC's identity."
+
+VISCA only defines addresses 1..7 (address 8 is broadcast). If `cmc_device_no` is outside that range (the field validates 1..255 for CAMERAD's benefit), VISCA falls back to address 1 with a WARN in the boot log.
+
+Snapshot once at init — changes to `cmc_device_no` require Save + Reboot to take effect for VISCA, matching how every other network-config change behaves.
 
 ## Ownership model
 
